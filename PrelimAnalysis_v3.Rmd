@@ -1,0 +1,353 @@
+---
+title: "PrelimAnalysis_2"
+output: html_document
+date: "2025-06-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Libraries used
+library(data.table)
+library(ComplexHeatmap)
+library(ggplot2)
+library(magick)
+library(limma)
+library(tidyverse)
+library(matrixStats)
+library(TCGAbiolinks)
+library(GenomicDistributions)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(org.Hs.eg.db)
+
+memory.limit(size = 28000)
+```
+
+
+# Initial reading and cleaning of data - Preprocessing
+``` {r Read in and clean data}
+methylData <- fread("Analysis/TCGA-BRCA.methylation450.tsv")
+
+methylDataClean <- methylData[complete.cases(methylData), ] # Removing rows for the purpose of the heatmap - non-numerical empty values (NAs)
+cpgIDs <- methylDataClean$`Composite Element REF`
+```
+
+``` {r TCGABiolinks}
+# Using TCGABiolinks to remotely download and utilise TCGA libraries of TCGA-BRCA with Illumina 450
+# Human Genome v. 38 (hg38)
+methQuery <- GDCquery(project="TCGA-BRCA", data.category = "DNA Methylation", platform = "Illumina Human Methylation 450", data.type="Methylation Beta Value")
+GDCdownload(methQuery)
+methQuery <- GDCprepare(methQuery)
+
+saveRDS(object = methQuery,
+        file = "methQuery.RDS",
+        compress = FALSE)
+# loading saved session: Once you saved your data, you can load it into your environment: 
+methlyData = readRDS(file = "methQuery.RDS")
+
+methylMat <- as.data.frame(SummarizedExperiment::assay(methylData))
+clinical <- data.frame(methylData@colData)
+
+ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg38) # hg38 annotation
+probeNA <- rowSums(is.na(methylMat)) # Find all rows with NA values
+probe <- probe.na[probeNA == 0] # Remove rows with all NA values <- store everything else in probe
+methylMat <- methylMat[row.names(met) %in% names(probe), ]
+
+## remove probes that match chromosomes  X and Y 
+keep <- !(row.names(met) %in% ann450k$Name[ann450k$chr %in% c("chrX","chrY")])
+table(keep)
+met <- met[keep, ]
+rm(keep) # remove no further needed probes.
+```
+
+
+# Overview of methylation peaks
+``` {r Finding variance to find the most variable CpG sites in the dataset}
+# Turn the data into a matrix for rowVars() to work (and later rowMeans())
+realMat <- methylDataClean[, .SD, .SDcols = sapply(methylDataClean, is.numeric)]
+brcaVariance <- rowVars(as.matrix(realMat), na.rm = TRUE)
+
+topVarianceInd <- order(brcaVariance, decreasing = TRUE)[1:1000]
+significantVariance <- brcaVariance[topVarianceInd]
+significantCpGs <- cpgIDs[topVarianceInd]
+
+varianceDataFrame <- data.frame(
+  CpG = significantCpGs,
+  Variance = significantVariance
+)
+
+# Scatter plot using ggplot
+ggplot(varianceDataFrame, aes(x = reorder(CpG, Variance), y = Variance)) +
+  geom_point(alpha = 0.2, size=0.2) +
+  labs(title = "Top 1000 Variant CpG Site",
+       x = "CpG Site", y = "Variance")
+
+
+# Subset BRCA subtypes to view difference across breast cancer types
+subsetVariance <- methylDataClean[`Composite Element REF` %in% significantCpGs]
+
+suffixes <- substr(colnames(subsetVariance), nchar(colnames(subsetVariance)) - 3, nchar(colnames(subsetVariance)))
+
+# Create subsets
+PrimaryTumoursVar <- subsetVariance[, suffixes %in% c("-01A", "-01B"), with=F]
+NormalVar <- subsetVariance[, suffixes %in% c("-11A", "-11B"), with=F]
+MetastaticTumoursVar <- subsetVariance[, suffixes %in% c("-06A", "-06B"), with=F]
+
+combinedMatrix <- cbind(PrimaryTumoursVar, NormalVar, MetastaticTumoursVar)
+
+# Explicit annotation
+groupLabels <- c(rep("Primary", ncol(PrimaryTumoursVar)), rep("Normal", ncol(NormalVar)), rep("Meta", ncol(MetastaticTumoursVar)))
+
+colAnnotation <- HeatmapAnnotation(
+  Sample_Type = groupLabels,
+  col = list(Sample_Type = c(
+    "Meta" = "darkgreen",
+    "Normal" = "pink",
+    "Primary" = "orange"
+  ))
+)
+
+# Methylation of all subgroups
+Heatmap(as.matrix(combinedMatrix),
+        name = "Methylation in Sign. Variant CpGs",
+        top_annotation = colAnnotation,
+        na_col = "grey",
+        show_row_names = F, show_column_names = F,
+        show_column_dend = F, show_row_dend = F,
+        column_split = groupLabels
+        )
+
+```
+
+
+``` {r Create standard dot-plots of CpGs of significant variance}
+subsetCpGIDs <- subsetVariance$`Composite Element REF`
+PrimaryTumoursVar$CpG <- subsetCpGIDs;NormalVar$CpG <- subsetCpGIDs;MetastaticTumoursVar$CpG <- subsetCpGIDs
+
+longPrimaryVar <- melt(
+  PrimaryTumoursVar,
+  id.vars = "CpG",
+  variable.name = "Sample",
+  value.name = "Beta"
+)
+longNormalVar <- melt(
+  NormalVar,
+  id.vars = "CpG",
+  variable.name = "Sample",
+  value.name = "Beta"
+)
+longMetaVar <- melt(
+  MetastaticTumoursVar,
+  id.vars = "CpG",
+  variable.name = "Sample",
+  value.name = "Beta"
+)
+
+# Plot out all variances amongst subgroups}
+longPrimaryVar$Group <- "Primary";longNormalVar$Group <- "Normal";longMetaVar$Group <- "Metastatic"
+longAll <- rbind(longPrimaryVar, longNormalVar, longMetaVar)
+
+ggplot(longAll, aes(x = CpG, y = Beta)) +
+  geom_point(alpha = 0.2, size = 0.2) +
+  facet_wrap(~ Group) +
+  labs(
+    title = "Top 1000 Variant CpG Site - Methylation Across Subgroups",
+    x = "CpG Sites", y = "Beta Value"
+  )+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+```
+
+# Average beta values across CpG sites
+``` {r T,N calculations}
+# Global beta-distributions
+avgPrimaryBeta <- rowMeans(as.matrix(realMat), na.rm = T)
+
+avgDataFrame <- data.frame(
+  CpG = cpgIDs,
+  AvgBeta = avgPrimaryBeta
+)
+
+ggplot(avgDataFrame, aes(x = reorder(CpG, AvgBeta), y = AvgBeta)) +
+  geom_point(alpha = 0.2) +
+  labs(title = "Average Beta values across CpG sites",
+       x = "CpG Site", y = "Avg Beta Value")
+
+# Subgroup beta-distributions -- Significantly variant sites
+suffixes <- substr(colnames(methylData), nchar(colnames(methylData)) - 3, nchar(colnames(methylData)))
+primaryTumours <- methylDataClean[, suffixes %in% c("-01A", "-01B"), with=F]
+normal <- methylDataClean[, suffixes %in% c("-11A", "-11B"), with=F]
+metastatic <- methylDataClean[, suffixes %in% c("-06A", "-06B"), with=F]
+
+avgBetaPrimary <- rowMeans(primaryTumours)
+avgBetaNormal <- rowMeans(normal)
+avgBetaMeta <- rowMeans(metastatic) 
+
+primaryTumours$CpG <- cpgIDs
+normal$CpG <- cpgIDs
+metastatic$CpG <- cpgIDs
+
+avgPrimaryDataFrame <- data.frame(
+  CpG = cpgIDs,
+  AvgBeta = avgBetaPrimary
+);avgNormalDataFrame <- data.frame(
+  CpG = cpgIDs,
+  AvgBeta = avgBetaNormal
+);avgMetaDataFrame <- data.frame(
+  CpG = cpgIDs,
+  AvgBeta = avgBetaMeta
+)
+
+colnames(avgPrimaryDataFrame)
+longPrimaryAvg <- melt(
+  PrimaryTumoursVar,
+  id.avg = "CpG",
+  value.name = "AvgBeta"
+);longNormalAvg <- melt(
+  NormalVar,
+  id.avg = "CpG",
+  value.name = "AvgBeta"
+);longMetaAvg <- melt(
+  MetastaticTumoursVar,
+  id.avg = "CpG",
+  value.name = "AvgBeta"
+)
+longPrimaryAvg$Group <- "Primary";longNormalAvg$Group <- "Normal";longMetaAvg$Group <- "Metastatic"
+
+
+ggplot(avgPrimaryDataFrame, aes(x = CpG, y = AvgBeta)) +
+  geom_point(alpha = 0.2, size = 0.1) +
+  labs(title = "Average Beta values across CpG sites (Primary cells)",
+       x = "CpG Site", y = "Avg Beta Value");ggplot(avgNormalDataFrame, aes(x = CpG, y = AvgBeta)) +
+  geom_point(alpha = 0.2, size = 0.1) +
+  labs(title = "Average Beta values across CpG sites (Normal cells)",
+       x = "CpG Site", y = "Avg Beta Value");ggplot(avgMetaDataFrame, aes(x = CpG, y = AvgBeta)) +
+  geom_point(alpha = 0.2, size = 0.1) +
+  labs(title = "Average Beta values across CpG sites (Metastatic cells)",
+       x = "CpG Site", y = "Avg Beta Value")
+
+
+# Combine subgroups to be displayed in a single graph
+longAvgAll <- rbind(longPrimaryAvg, longNormalAvg, longMetaAvg)
+head(colnames(avgNormalDataFrame))
+
+# Currently issue with the 'variable' naming where it is only a single sample name after merge
+ggplot(longAvgAll, aes(x = variable, y = AvgBeta)) +
+  geom_point(alpha = 0.2, size = 0.2) +
+  facet_wrap(~ Group) +
+  labs(
+    title = "Average Methylation across CpG Sites - Across Subgroups",
+    x = "CpG Sites", y = "Beta Value"
+  ) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+```
+
+
+# Annotation
+``` {r Annotation of methylation (without ChIPseeker)}
+ProbeMap <- read.delim("Analysis/HM450.hg38.manifest.gencode.v36.probeMap", sep='\t')
+colnames(ProbeMap)
+# Subset to only CpGs with significant variance
+sigfVarProbeInfo <- ProbeMap[ProbeMap$X.id %in% significantCpGs, ]
+
+# Change name of earlier mapping df to compare to probe map data
+colnames(sigfVarProbeInfo)[1] <- "CpG"
+variantProbes <- merge(varianceDataFrame, sigfVarProbeInfo, , by = "CpG", all.x = T)
+ggplot(variantProbes, aes(x = chrom, y = Variance)) +
+  geom_point(alpha = 0.2) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "CpG Variance sites by Chromosomes")
+
+longCombined <- merge(longAll, sigfVarProbeInfo, by = "CpG", all.x = T)
+ggplot(longCombined, aes(x = chrom, y = Beta)) +
+  geom_jitter(alpha = 0.3, size = 0.4) +
+  geom_boxplot() +
+  theme_minimal() +
+  facet_wrap(~ Group) +
+  labs(
+    title = "Methylation of Significant CpG Sites by Chromosome",
+    x = "Chromosome",
+    y = "Beta Value")
+  
+```
+
+``` {r Annotation of tcga-brca methylation with ChIPseeker}
+ 
+
+covplot(as.GRanges(cpgAnnotations), title = "CpG Site coverage across Chromosomes")
+
+ggplot(annotatedMethylation, aes(x = seqnames, y = Beta, fill = Group)) +
+  geom_boxplot(outlier.size = 0.4) +
+  labs(
+    title = "DNA Methylation by Chromosome",
+    x = "Chromosome",
+    y = "Beta Value"
+  ) +
+  theme_minimal() 
+
+# Annotating average methylation
+avgPrimaryAnnotated <- merge(avgPrimaryDataFrame, annotatedPeaks, by = "CpG", all.x = TRUE)
+avgNormalAnnotated  <- merge(avgNormalDataFrame, annotatedPeaks, by = "CpG", all.x = TRUE)
+avgMetaAnnotated    <- merge(avgMetaDataFrame, annotatedPeaks, by = "CpG", all.x = TRUE)
+
+avgPrimaryAnnotated$Group <- "Primary"
+avgNormalAnnotated$Group <- "Normal"
+avgMetaAnnotated$Group <- "Metastatic"
+
+avgAnnotatedAll <- rbind(avgPrimaryAnnotated, avgNormalAnnotated, avgMetaAnnotated)
+
+ggplot(avgAnnotatedAll, aes(x = annotation, y = AvgBeta, fill = Group)) +
+  geom_boxplot(outlier.size = 0.5) +
+  labs(
+    title = "Average DNA Methylation by Genomic Feature",
+    x = "Genomic Annotation",
+    y = "Average Beta Value"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+# ATAC-Seq Analysis
+Data: https://xenabrowser.net/datapages/?dataset=brca%2Fbrca_peak_Log2Counts_dedup&host=https%3A%2F%2Fatacseq.xenahubs.net&removeHub=https%3A%2F%2Fpcawg.xenahubs.net
+The data is already +5, log2-transformed and quantile normalised before being put into the table
+``` {r ATAC-Seq Data}
+atacData <- fread("Analysis/brca-brca_peak_Log2Counts_dedup") # Only primary tumors used as samples
+
+cleanATACData <- atacData[complete.cases(atacData),]
+atacCpgIDs <- cleanATACData$sample
+# General variance for samples
+atacMatrixForm <- cleanATACData[, .SD, .SDcols = sapply(cleanATACData, is.numeric)]
+atacVariance <- rowVars(as.matrix(atacMatrixForm), na.rm = TRUE)
+
+
+topVarianceIndATAC <- order(atacVariance, decreasing = TRUE)[1:1000]
+significantVarianceATAC <- atacVariance[topVarianceIndATAC]
+significantATACCpgs <- atacCpgIDs[topVarianceIndATAC]
+
+atacVarianceDF <- data.frame(
+  CpG = significantATACCpgs,
+  Variance = significantVarianceATAC
+)
+
+ggplot(atacVarianceDF, aes(x = CpG, y = Variance)) +
+  geom_point(alpha = 0.2, size=0.2) +
+  labs(title = "Top 1000 Variant CpG Sites (ATAC)",
+       x = "CpG Site", y = "Variance")
+
+```
+
+``` {r ATAC-Seq ChIPseeker mapping}
+class(atacVarianceDF)
+
+head(atacVarianceDF)
+```
+
+``` {r Probe-mapping for ATAC-Seq}
+atacProbeMap <- read.delim("Analysis/brca-brca_peak.probeMap", sep='\t')
+head(atacProbeMap) # Compare with beta methylation - the chromosome, start and stop regions.
+```

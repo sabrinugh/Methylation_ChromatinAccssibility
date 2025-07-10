@@ -1,0 +1,242 @@
+
+---
+title: "Analysis_Pipeline_v1"
+output: html_document
+date: "2025-07-01"
+---
+
+```{r Setup (including loading data), include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load in any necessary libraries
+library(ChIPseeker)
+library(ComplexHeatmap)
+library(ggplot2)
+library(tidyverse)
+library(data.table)
+library(GenomicDistributions)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene) # For ChIPseeker analysis
+library(org.Hs.eg.db) # For ChIPseeker analysis
+library(matrixStats)
+library(magick)
+library(reshape2)
+
+# Read in all necessary data
+rawMethData <- fread("Data/TCGA-BRCA.methylation450.tsv")
+rawATACData <- fread("Data/brca-brca_peak_Log2Counts_dedup")
+
+methProbe <- read.delim("Data/HM450.hg38.manifest.gencode.v36.probeMap", sep='\t')
+atacProbe <- read.delim("Data/brca-brca_peak.probeMap", sep='\t')
+```
+
+``` {r General data understanding}
+methHeatmapData <- rawMethData[complete.cases(rawMethData)]
+atacHeatmapData <- rawATACData[complete.cases(rawATACData)]
+
+Heatmap(methHeatmapData, use_raster = T, name = "Methylation Beta Values")
+Heatmap(atacHeatmapData, use_raster = T, name = "ATAC-seq log^2 Values")
+```
+
+``` {r Filter for 39 samples wiith both ATAC-seq and methylation data}
+colnames(rawMethData)[1] <- "sample"
+methSamples <- colnames(rawMethData);atacSamples <- colnames(rawATACData)
+commonSamples <- intersect(methSamples, atacSamples)
+
+# Step 3: Subset both datasets to retain only common samples (columns)
+rawMethData <- rawMethData[, ..commonSamples]
+rawATACData <- rawATACData[, ..commonSamples]
+
+# Test for duplicate samples (for some reason there's 42 when there are 39 confirmed multiple samples)
+# may be due to the 01B and 01A subtypes
+test <- commonSamples[-1]
+
+# Extract TCGA patient IDs (first 3 fields)
+patientIDs <- sapply(strsplit(test, "-"), function(x) paste(x[1:3], collapse = "-"))
+
+# Check for duplicates
+unique(patientIDs[duplicated(patientIDs)])
+```
+
+# Section 1: Methylation values
+``` {r Section 1: Methylation values}
+# Clean  data - removing any rows with NA values
+methData <- rawMethData[complete.cases(rawMethData),]
+
+# Sample subgroups
+methCols <- colnames(methData); suffixes <- substr(methCols, nchar(methCols) - 3, nchar(methCols))
+methPrimary <- methData[, suffixes %in% c("-01A", "-01B"), with = F]
+methNormal <- methData[, suffixes %in% c("-11A", "-11B"), with = F] 
+methMetastatic <- methData[, suffixes %in% c("-06A", "-06B"), with = F]
+
+### Variant methylation
+methMatrix <- as.matrix(methData[, .SD, .SDcols = sapply(methData, is.numeric)])
+methCpGIDs <- methData[[1]]
+
+methVariant <- rowVars(methMatrix, na.rm = T)
+methTopVarianceInd <- order(methVariant, decreasing = TRUE)[1:1000]
+methSignificantVariance <- methVariant[methTopVarianceInd]
+methSignificantCpGs <- methCpGIDs[methTopVarianceInd]
+
+sigMethData <- methData[methCpGIDs %in% methSignificantCpGs, ] # data.frame, data.table
+sigMethDataMatrix <- as.matrix(sigMethData[, .SD, .SDcols = sapply(sigMethData, is.numeric)])
+
+### Mean methylation (sample-groups and global)
+avgMethPrimary <- rowMeans(methPrimary);avgMethNormal <- rowMeans(methNormal);avgMethMetastatic <- rowMeans(methMetastatic)
+avgMethAll <- rowMeans(methMatrix)
+
+avgBetaAll <- data.frame(
+  Primary = avgMethPrimary,
+  Normal = avgMethNormal, 
+  Metastatic = avgMethMetastatic,
+  Global = avgMethAll
+)
+avgBetaLong <- pivot_longer(avgBetaAll, cols = everything(), names_to = "Group", values_to = "BetaValue") # Ready to plot
+
+# Subset the significant rows to find the columns with the right names
+methTopPrimary <- sigMethData[, suffixes %in% c("-01A", "-01B"), with = F]
+methTopNormal <- sigMethData[, suffixes %in% c("-11A", "-11B"), with = F] 
+methTopMetastatic <- sigMethData[, suffixes %in% c("-06A", "-06B"), with = F]
+
+avgTopPrimary <- rowMeans(methTopPrimary); avgTopNormal <- rowMeans(methTopNormal); avgTopMetastatic <- rowMeans(methTopMetastatic)
+avgTopAll <- rowMeans(sigMethDataMatrix, na.rm = T)
+avgTopBetaAll <- data.frame(
+  Primary = avgTopPrimary,
+  Normal = avgTopNormal,
+  Metastatic = avgTopMetastatic,
+  Global = avgTopAll
+)
+avgTopLong <- pivot_longer(avgTopBetaAll, cols = everything(), names_to = "Group", values_to = "BetaValue") # Ready to plot
+
+## Plot the Variation for global and subsets
+varMethPrimary <- rowVars(as.matrix(methPrimary)); varMethNormal <- rowVars(as.matrix(methNormal)); varMethMetatstatic <- rowVars(as.matrix(methMetastatic))
+globalMethVariants <- data.frame(
+  Primary = varMethPrimary,
+  Normal = varMethNormal, 
+  Metastatic = varMethMetatstatic,
+  Global = methVariant
+)
+varLong <- pivot_longer(globalMethVariants, col = everything(), names_to = "Group", values_to = "BetaValue")
+```
+
+# Section 2: ATAC-seq
+```{r Section 2: ATAC-seq Chromatin peak analysis}
+## Don't need to fiflter for sub-groups in the case of TCGA-BRCA ATAC-seq as it is only pirmary tumour samples
+## Additional code for filtering may be added if future data may include other ATAC-seq samples
+# Clean data - removing any rows with NA values
+atacData <- rawATACData[complete.cases(rawATACData),]
+peakIDs <- atacData[[1]]
+
+atacMatrix <- as.matrix(atacData[, -1, with = F])
+
+avgATAC <- rowMeans(atacMatrix, na.rm = T) # Global averages
+varATAC <- rowVars(atacMatrix, na.rm = T) # Global variance - use to find those of significance
+atacTopVarianceInd <- order(varATAC, decreasing = T)[1:1000]
+atacTopVar <- atacData[atacTopVarianceInd, ]
+atacSignificantPeaks <- peakIDs[atacTopVarianceInd] # BRCA IDs of top 1000 peaks of significance 
+
+atacDF <- data.frame(
+  Peak = peakIDs,
+  Mean = avgATAC,
+  Variance = varATAC
+)
+
+atacLong <- melt(atacDF, id.vars = "Peak", variable.name = "Metric", value.name = "Value")
+
+```
+
+# Section 3: Annotations of both data types
+``` {r Annotations - Using ChIPseeker}
+methProbe <- methProbe[complete.cases(methProbe[, c("chrom", "chromStart", "chromEnd")]), ]
+atacProbe <- atacProbe[complete.cases(atacProbe[, c("chrom", "chromStart", "chromEnd")]), ]
+
+# Setting up the map to the h38 genomes
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+methGrcRanges <- GRanges(
+  seqnames = methProbe$chrom,
+  ranges = IRanges(start = methProbe$chromStart, end = methProbe$chromEnd),
+  names = methProbe$X.id
+)
+atacGrcRanges <- GRanges(
+  seqnames = atacProbe$chrom,
+  ranges = IRanges(start = atacProbe$chromStart, end = atacProbe$chromEnd),
+  names = atacProbe$id
+)
+
+## Finding the significant variant probe details to compare with the global # might want to look at the variants only in primary for the methylation data
+significantMethProbe <- methProbe[methProbe$X.id %in% methSignificantCpGs,]
+significantATACProbe <- atacProbe[atacProbe$id %in% atacSignificantPeaks,]
+
+# Significant methylation sites for Primary tumour samples
+significantMethPrimaryProbe <- methProbe
+
+
+methSignificantGrcRanges <- GRanges(
+  seqnames = significantMethProbe$chrom, 
+  ranges = IRanges(start = significantMethProbe$chromStart, end = significantMethProbe$chromEnd),
+  names = significantMethProbe$X.id 
+) # Note that the methylation data one includes primary, normal and metastatic samples - might want to use a filtered primary tumour version
+atacSignificantGrcRanges <- GRanges(
+  seqnames = significantATACProbe$chrom, 
+  ranges = IRanges(start = significantATACProbe$chromStart, end = significantATACProbe$chromEnd),
+  names = significantATACProbe$X.id
+) # Contains only primary tumour data which is more relevant to the general comparison of interplay
+
+
+# Annotating the regions with the human genome
+methCpGAnnotations <- annotatePeak(
+  methGrcRanges, 
+  TxDb=txdb,
+  annoDb="org.Hs.eg.db"
+) 
+atacPeakAnnotations <- annotatePeak(
+  atacGrcRanges, 
+  TxDb=txdb,
+  annoDb="org.Hs.eg.db"
+) 
+sigMethCpGAnnotations <- annotatePeak(
+  methSignificantGrcRanges, 
+  TxDb=txdb,
+  annoDb="org.Hs.eg.db"
+) 
+sigATACPeakAnnotations <- annotatePeak(
+  atacSignificantGrcRanges, 
+  TxDb=txdb,
+  annoDb="org.Hs.eg.db"
+) 
+
+methAnnotatedPeaks <- as.data.frame(methCpGAnnotations)
+methTablePeaks <- table(methAnnotatedPeaks$annotation)
+atacAnnotatedPeaks <- as.data.frame(atacPeakAnnotations)
+atacTablePeaks <- table(atacAnnotatedPeaks$annotation)
+```
+
+# Plots
+``` {r Graphically display the data}
+ggplot(avgTopLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() + 
+  theme_minimal() +
+  labs(title = "Mean beta methylation for each sample Subgroup (Top variant)", x = "Sample type", y = "Avg. Beta Value")
+ggplot(avgBetaLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Mean beta methylation for each sample Subgroup (Globally)", x = "Sample type", y = "Avg. Beta Value")
+ggplot(varLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Variants across Samples types and Globally for methylation", x = "Sample type", y = "Beta Value")
+
+## Global mean and variance - ATAC-seq
+ggplot(atacLong, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "ATAC-seq Peak Mean and Variance")
+
+## Global Annotations
+plotAnnoBar(methCpGAnnotations) + labs(title = "Global ProbeMap for (Beta)Methylation")
+plotAnnoBar(sigMethCpGAnnotations) + labs(title = "ProbeMap on Top significant CpG sites (Beta methylation) ")
+plotAnnoBar(atacPeakAnnotations) + labs(title = "Global ProbeMap for ATAC-seq")
+plotAnnoBar(sigATACPeakAnnotations) + labs(title = "ProbeMap on Top significant Peaks (ATAC-seq)")
+
+```
+

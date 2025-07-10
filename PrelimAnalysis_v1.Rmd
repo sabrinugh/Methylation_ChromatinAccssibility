@@ -1,0 +1,220 @@
+---
+title: "Prelim_Analysis"
+output: html_document
+date: "2025-05-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Illumina Human Methylation 450
+Ref: https://xenabrowser.net/datapages/?dataset=TCGA-BRCA.methylation450.tsv&host=https%3A%2F%2Fgdc.xenahubs.net&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443
+```{r Background info into study}
+library(readxl)
+library(ggplot2)
+library(tidyverse)
+
+table1 <- read_excel("metadata.xlsx", sheet=1)
+table2 <- read_excel("metadata.xlsx", sheet=2)
+
+mergedData = merge(table1, table2, by=c('submitter_id', 'case_id'))
+colnames(mergedData) # remove ethnicity and one version of cohort
+
+filteredData <- mergedData[mergedData$`Passed_QC?`==TRUE, !names(mergedData) %in% c("cohort.y", "demographic.ethnicity","BRCA_ic10")]
+head(filteredData)
+
+ggplot(filteredData, aes(x = BRCA_pam50)) +
+  geom_bar(fill = "coral") +
+  labs(title = "BRCA PAM50 Subtypes", x = "Subtype", y = "Count")
+
+ggplot(filteredData, aes(x = demographic.race)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Demographic Race", x = "Race", y = "Count")
+
+```
+
+```{r Methylation data} 
+library(pheatmap)
+methylationData <- read.csv("TCGA-BRCA.methylation450.tsv", sep = '\t', nrows = 15000)
+#methylationData <- read.csv("TCGA-BRCA.methylation27.tsv", sep = '\t') # Illumina 27 version of data
+
+# Find rows with all NA applications, and remove them
+methylationMatrix <- methylationData[, -1]
+rownames(methylationMatrix) <- methylationMatrix$Composite.Element.REF
+
+# Removing rows for the purpose of the heatmap - non-numerical empty values (NAs)
+methylDataClean <- methylationMatrix[complete.cases(methylationMatrix), ] # Remove any row with a NA value (not just complete NA rows)
+
+```
+
+``` {r Basic overview with heatmap (without annotation)}
+library(ComplexHeatmap)
+library(magick)
+Heatmap(methylDataClean, use_raster = T,
+      name = "Methylation Beta Values (CpG Sites 1:25000)"
+)
+```
+
+``` {r Sub-grouping Methylation data}
+# Use a subset of the first 1000 rows
+smallData <- methylDataClean[1:1000,1:893] # Kinda redundant, can change size of data being used or directly load only 5000 CpG sites
+suffixes <- sub(".*(.[0-9]{2}[AB])$", "\\1", colnames(smallData))
+
+# Create subsets
+PrimaryTumours <- smallData[, suffixes %in% c(".01A", ".01B")]
+Normal <- smallData[, suffixes %in% c(".11A", ".11B")]
+MetastaticTumours <- smallData[, suffixes %in% c(".06A", ".06B")]
+```
+
+``` {r ComplexHeatmaps of Tumour Subtypes}
+#BiocManager::install("ComplexHeatmap")
+library(ComplexHeatmap)
+
+# Plotting only the first 1000 CpG sites, as subsetted in the above block ^ for each subgroup
+# Rows not clustered to see the changes between all subgroups across the CpG sites
+Heatmap(Normal, 
+        name = "Methylation in Normal cells",
+        na_col = 'grey',
+        cluster_rows = F, cluster_columns = F,
+        show_column_names = F, show_row_names = F
+        )
+
+Heatmap(PrimaryTumours, 
+        name = "Methylation in Primary Tumours",
+        na_col = 'grey',
+        cluster_rows = F, cluster_columns = F,
+        show_column_names = F, show_row_names = F
+        )
+
+Heatmap(MetastaticTumours, 
+        name = "Methylation in Metastatic Tumours",
+        na_col = 'grey',
+        cluster_rows = F, cluster_columns = F,
+        show_column_names = F,show_row_names = F
+        )
+
+# Plot all sub-types into a single heatmap and annotate
+combinedMatrix <- cbind(PrimaryTumours, Normal, MetastaticTumours)
+
+# Explicit annotation required for plotting in complex heatmap
+groupLabels <- c(rep("Primary", ncol(PrimaryTumours)), rep("Normal", ncol(Normal)), rep("Meta", ncol(MetastaticTumours)))
+
+colAnnotation <- HeatmapAnnotation(
+  Sample_Type = groupLabels,
+  col = list(Sample_Type = c(
+    "Meta" = "darkgreen",
+    "Normal" = "pink",
+    "Primary" = "orange"
+  ))
+)
+
+# Methylation of all subgroups
+Heatmap(combinedMatrix,
+        name = "Methylation",
+        top_annotation = colAnnotation,
+        na_col = "grey",
+        show_row_names = F, show_column_names = F,
+        show_column_dend = F, show_row_dend = F,
+        column_split = groupLabels
+        )
+
+```
+
+``` {r Average Beta Value across CpG sites}
+library(ggplot2)
+
+avgPrimaryBeta <- rowMeans(PrimaryTumours, na.rm = T)
+avgNormalBeta <- rowMeans(Normal, na.rm=T)
+avgMetaBeta <- rowMeans(MetastaticTumours, na.rm = T)
+
+avgBetaMatrix <- cbind(avgPrimaryBeta, avgNormalBeta, avgMetaBeta)
+colnames(avgBetaMatrix) <- c("Primary", "Normal", "Metastatic")
+
+# clean_matrix <- avgBetaMatrix[complete.cases(avgBetaMatrix), ] # Cleaning matrix - remove all NAs present, rather than just removing all NA only rows
+Heatmap(avgBetaMatrix,
+        name = "T, N Beta Values",
+        show_row_names = F
+        )
+
+ggplot(avgBetaMatrix)
+
+```
+
+``` {r Differential Methylation - DSS}
+library(limma) # Making differentiation easier
+group <- factor(groupLabels, levels = c("Normal", "Primary", "Meta")) # Group labels for differentiation in next steps
+
+# M-values more significant during differentiation so changing beta values. Note: beta values show more biological significance, m-values show statistical significance
+betaM <- function(beta) {
+  log2(beta / (1 - beta))
+}
+mMatrix <- betaM(combinedMatrix)
+
+# Create a differentiation model, and fit it to the m-value table alongside the subgroups (primary, metastatic, normal) 
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+fit <- lmFit(mMatrix, design)
+
+# Define pairwise comparisons
+contrast.matrix <- makeContrasts(
+  Primary_vs_Normal = Primary - Normal,
+  Metastatic_vs_Normal = Meta - Normal,
+  Metastatic_vs_Primary = Meta - Primary,
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrast.matrix) # Fit the comparisons with the linear model based off the design
+fit2 <- eBayes(fit2)
+
+# Top 500 differentially methylated CpG sites per comparison
+topResultsPvN <- topTable(fit2, coef = "Primary_vs_Normal", number = 500, adjust = "BH")
+topResultsMvN <- topTable(fit2, coef = "Metastatic_vs_Normal", number = 500, adjust = "BH")
+topResultsMvP <- topTable(fit2, coef = "Metastatic_vs_Primary", number = 500, adjust = "BH")
+
+# Subset M matrix to CpGs for each comparison
+matrixPvN <- mMatrix[rownames(topResultsPvN), ]
+matrixMvN <- mMatrix[rownames(topResultsMvN), ]
+matrixMvP <- mMatrix[rownames(topResultsMvP), ]
+
+
+# Plot the most differentially methylated CpG sites
+# Does this even make sense?
+Heatmap(matrixPvN,
+        name = "Top PvN M-values",
+        column_split = group,
+        show_row_names = F, show_column_names = F,
+        cluster_rows = F
+        )
+
+Heatmap(matrixMvN,
+        name = "Top MvN M-values",
+        column_split = group,
+        show_row_names = F, show_column_names = F,
+        cluster_rows = F
+        )
+Heatmap(matrixMvP,
+        name = "Top MvP M-values",
+        column_split = group,
+        show_row_names = F, show_column_names = F,
+        cluster_rows = F
+        )
+```
+
+``` {r potentially more differentiation/splitting of data for readibility}
+### Wilcox-paired test to check the differentiation between subgroups # won't work unless the data is modified to remove the sample names
+# First modify, then try applying Wilcox to it (Mann-Whitney cause it's paired)
+columnNamesTest <- colnames(MetastaticTumours)
+
+colnames(MetastaticTumours) <- NULL
+class(MetastaticTumours)
+
+wilcox.test(MetastaticTumours)
+```
+
+``` {r ProbeMap meta-data}
+ProbeMap <- read.delim("HM450.hg38.manifest.gencode.v36.probeMap", sep='\t')
+head(ProbeMap)
+
+```
