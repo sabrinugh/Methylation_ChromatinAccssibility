@@ -1,0 +1,346 @@
+---
+title: "AnalysisPipeline_v3"
+output: html_document
+date: "2025-07-17"
+description: "Analysing methylation and ATAC-seq data, filtering for top variant sites in each data type, sub-setting into sample types and further plotting the data as a visual representation using ggplot2 boxplots. "
+---
+
+```{r setup, include=FALSE, message = FALSE, warning = FALSE }
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load in any necessary libraries
+library(ChIPseeker)
+library(ComplexHeatmap)
+library(ggplot2)
+library(tidyverse) # Re-organising data for plotting purposes
+library(data.table)
+library(GenomicDistributions)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene) # For ChIPseeker analysis
+library(org.Hs.eg.db) # For ChIPseeker analysis
+library(matrixStats)
+library(magick)
+
+# mem.maxVSize(1600000) # Increasing vector memory limit
+# Read in all necessary data - based on file pathing
+rawMethData <- fread("Data/TCGA-BRCA.methylation450.tsv")
+rawATACData <- fread("Data/brca-brca_peak_Log2Counts_dedup")
+
+methProbe <- read.delim("Data/HM450.hg38.manifest.gencode.v36.probeMap", sep='\t')
+atacProbe <- read.delim("Data/brca-brca_peak.probeMap", sep='\t')
+```
+
+## Section 1: Methylation Values
+
+```{r}
+# Clean and sub-group sample types
+methData <- rawMethData[complete.cases(rawMethData), ]
+methCpGIDs <- methData[[1]]
+
+methCols <- colnames(methData); suffixes <- substr(methCols, nchar(methCols) - 3, nchar(methCols))
+primaryMeth <- methData[, suffixes %in% c("-01A", "-01B"), with = F]
+normalMeth <- methData[, suffixes %in% c("-11A", "-11B"), with = F]
+metastaticMeth <- methData[, suffixes %in% c("-06A", "-06B"), with = F]
+
+# Subset to find top variants
+methMatrix <- as.matrix(methData[, .SD, .SDcols = sapply(methData, is.numeric)])
+methVar <- rowVars(methMatrix, na.rm = T)
+methTopVarInd <- order(methVar, decreasing = T)[1:1000]
+methSigVar <- methVar[methTopVarInd]
+methSigCpGs <- methCpGIDs[methTopVarInd]
+
+varMethData <- methData[methCpGIDs %in% methSigCpGs, ]
+varMethMatrix <- as.matrix(varMethData[, .SD, .SDcols = sapply(varMethData, is.numeric)])
+
+# Mean global and top-variant site methylation
+avgPrimary <- rowMeans(primaryMeth)
+avgNormal <- rowMeans(normalMeth)
+avgMetastatic <- rowMeans(metastaticMeth)
+avgMethAll <- rowMeans(methMatrix)
+
+avgMethylationAll <- data.frame(
+  Primary = avgPrimary,
+  Normal = avgNormal,
+  Metastatic = avgMetastatic,
+  Global = avgMethAll
+)
+
+avgMethylationLong <- pivot_longer(avgMethylationAll, cols = everything(), names_to = "Group", values_to = "BetaValue") # Global mean methylation
+
+avgPrimaryTop <- rowMeans(varMethData[, suffixes %in% c("-01A", "-01B"), with = F])
+avgNormalTop <- rowMeans(varMethData[, suffixes %in% c("-11A", "-11B"), with = F])
+avgMetastaticTop <- rowMeans(varMethData[, suffixes %in% c("-06A", "-06B"), with = F])
+avgTopAll <- rowMeans(varMethMatrix, na.rm = T)
+
+avgTopMethylationAll <- data.frame(
+  Primary = avgPrimaryTop,
+  Normal = avgNormalTop,
+  Metastatic = avgMetastaticTop,
+  Global = avgTopAll
+)
+
+avgTopLong <- pivot_longer(avgTopMethylationAll, col = everything(), names_to = "Group", values_to = "BetaValue")
+
+varPrimary <- rowVars(as.matrix(primaryMeth))
+varNormal <- rowVars(as.matrix(normalMeth))
+varMetastatic <- rowVars(as.matrix(metastaticMeth))
+globalMethVars <- data.frame(
+  Primary = varPrimary,
+  Normal = varNormal,
+  Metastatic = varMetastatic,
+  Global = methVar
+)
+
+varLong <- pivot_longer(globalMethVars, col = everything(), names_to = "Group", values_to = "BetaValue")
+
+varPrimaryTop <- rowVars(as.matrix(varMethData[, suffixes %in% c("-01A", "-01B"), with = F]))
+varNormalTop <- rowVars(as.matrix(varMethData[, suffixes %in% c("-11A", "-11B"), with = F]))
+varMetastaticTop <- rowVars(as.matrix(varMethData[, suffixes %in% c("-06A", "-06B"), with = F]))
+globalTopMethVars <- data.frame(
+  Primary = varPrimaryTop,
+  Normal = varNormalTop,
+  Metastatic = varMetastaticTop,
+  Global = methSigVar
+)
+
+varTopLong <- pivot_longer(globalTopMethVars, col = everything(), names_to = "Group", values_to = "BetaValue")
+```
+
+## Section 2: ATAC-seq Values
+
+```{r}
+atacData <- rawATACData[complete.cases(rawATACData), ]
+peakIDs <- atacData[[1]]
+
+atacMatrix <- as.matrix(atacData[, .SD, .SDcols = sapply(atacData, is.numeric)])
+avgATAC <- rowMeans(atacMatrix, na.rm = T)
+varATAC <- rowVars(atacMatrix, na.rm = T)
+
+varATACTopInd <- order(varATAC, decreasing = T)[1:1000]
+varATACTop <- atacData[varATACTopInd, ]
+sigATACPeaks <- peakIDs[varATACTopInd]
+
+atacDF <- data.frame(
+  Peak = peakIDs,
+  Mean = avgATAC,
+  Variance = varATAC
+)
+
+atacLong <- pivot_longer(atacDF, cols = c("Mean", "Variance"), names_to = "Group", values_to = "BetaValue")
+```
+
+--------
+
+# Additional: Separate to find the correlation between the samples with both ATAC-seq and methylation data
+
+``` {r Doing the same above analysis for the samples in both the methylation and ATAC-seq data}
+# Ensure names are modified for continuity purposes
+colnames(methData)[1] <- "sample"
+colnames(atacData)[1] <- "sample"
+methSamples <- colnames(methData); atacSamples <- colnames(atacData)
+commonSamples <- intersect(methSamples, atacSamples)
+
+# Subset the datasets to retain only the common samples
+mutualMeth <- methData[, ..commonSamples]
+mutualATAC <- atacData[, ..commonSamples]
+```
+
+``` {r Common Methylation}
+mutColnames <- colnames(mutualMeth); mutSuffixes <- substr(mutColnames, nchar(mutColnames) - 3, nchar(mutColnames))
+# Only primary tumour samples relevant as it's the only sample type shared with
+
+# Top variants of samples
+mutMethMat <- as.matrix(mutualMeth[, .SD, .SDcols = sapply(mutualMeth, is.numeric)])
+mutMethVar <- rowVars(mutMethMat, na.rm = T)
+mutTopVarInd <- order(mutMethVar, decreasing = T)[1:1000]
+mutMethSigVar <- mutMethVar[mutTopVarInd]
+mutMethSigCpG <- methCpGIDs[mutTopVarInd]
+
+mutVarSigMethData <- mutualMeth[methCpGIDs %in%  mutMethSigCpG, ]
+mutVarMethMatrix <- as.matrix(mutVarSigMethData[, .SD, .SDcols = sapply(mutVarSigMethData, is.numeric)])
+
+# Global avgs. for sample types
+avgMutPrimary <- rowMeans(mutualMeth)
+# Avg. for the top significant variances
+avgMutPrimaryTop <- rowMeans(mutVarSigMethData[, mutSuffixes %in% c("-01A", "-01B"), with = F])
+
+varMutPrimary <- rowVars(as.matrix(mutMethPrimary)) # Global variance
+varMutPrimaryTop <- rowVars(mutVarMethMatrix)
+
+mutAvgMethAll <- data.frame(
+  AvgBeta = c(avgMutPrimary, avgMutPrimaryTop),
+  Group = c(
+    rep("All CpGs", length(avgMutPrimary)),
+    rep("Top Variable CpGs", length(avgMutPrimaryTop))
+  )
+)
+
+mutVarMethAll <- data.frame(
+  VarBeta = c(varMutPrimary, varMutPrimaryTop),
+  Group = c(
+    rep("All CpGs", length(varMutPrimary)),
+    rep("Top Variable CpGs", length(varMutPrimaryTop))
+  )
+)
+```
+
+``` {r Common ATAC-seq}
+        # ATAC-seq analysis
+  #      varATACTop # Contains top variant atac-seq peaks
+  #      mutualATAC # mutual sample data of the atac-seq data
+        ## now need to subset `mutualATAC` to find the peaks of `varATACTop` - no need to subset sample type, know it's already primary tumour samples
+mutAtacMat <- as.matrix(mutualATAC[, .SD, .SDcols = sapply(mutualATAC, is.numeric)])
+
+# Global mean and variance of ATAC-seq data
+avgMutAtac <- rowMeans(mutAtacMat, na.rm = T) 
+varMutAtac <- rowVars(mutAtacMat, na.rm = T)
+
+mutVarAtacTopInd <- order(varMutAtac, decreasing = T)[1:1000]
+mutVarAtacTop <- mutualATAC[mutVarAtacTopInd, ]
+mutSigAtacPeaks <- peakIDs[mutVarAtacTopInd]
+
+mutVarAtacTopMat <- as.matrix(mutVarAtacTop[, .SD, .SDcols = sapply(mutVarAtacTop, is.numeric)])
+avgMutAtacTop <- rowMeans(mutVarAtacTopMat)# Global variance
+varMutAtacTop <- rowVars(mutVarAtacTopMat)
+
+mutAtacDF <- data.frame(
+  Mean = avgMutAtac,
+  Variance = varMutAtac
+)
+mutAtacTopDF <- data.frame(
+  Mean = avgMutAtacTop,
+  Variance = varMutAtacTop
+)
+
+mutAvgAtacAll <- data.frame(
+  Value = c(avgMutAtac, avgMutAtacTop),
+  Group = c(
+    rep("All CpGs", length(avgMutAtac)),
+    rep("Top Variable Peaks", length(avgMutAtacTop))
+  )
+)
+mutVarAtacAll <- data.frame(
+  Value = c(varMutAtac, varMutAtacTop),
+  Group = c(
+    rep("All Peaks", length(varMutAtac)),
+    rep("Top Variable Peaks", length(varMutAtacTop))
+  )
+)
+
+```
+
+--------
+
+## Section 3: Annotations
+
+``` {r}
+# Remove missing data rows
+methProbe <- methProbe[complete.cases(methProbe[, c("chrom", "chromStart", "chromEnd")]), ]
+atacProbe <- atacProbe[complete.cases(atacProbe[, c("chrom", "chromStart", "chromEnd")]), ]
+colnames(methProbe)[1] <- "id";colnames(atacProbe)[1] <- "id" #Rename for convention
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+methGrcRanges <- GRanges(
+  seqnames = methProbe$chrom,
+  ranges = IRanges(start = methProbe$chromStart, end = methProbe$chromEnd),
+  names = methProbe$id
+)
+atacGrcRanges <- GRanges(
+  seqnames = atacProbe$chrom,
+  ranges = IRanges(start = atacProbe$chromStart, end = atacProbe$chromEnd),
+  names = atacProbe$id
+)
+
+# Top variant significant CpG sites
+sigMethProbe <- methProbe[methProbe$id %in% methSignificantCpGs, ]
+sigATACProbe <- atacProbe[atacProbe$id %in% sigATACPeaks, ]
+
+methSigGrcRanges <- GRanges(
+  seqnames = sigMethProbe$chrom,
+  ranges = IRanges(start = sigMethProbe$chromStart, end = sigMethProbe$chromEnd),
+  names = sigMethProbe$id
+)
+atacSigGrcRanges <- GRanges(
+  seqnames = sigATACProbe$chrom,
+  ranges = IRanges(start = sigATACProbe$chromStart, end = sigATACProbe$chromEnd),
+  names = sigATACProbe$id
+)
+
+# Full annotations
+methCpGAnnotations <- annotatePeak(
+  methGrcRanges,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+atacPeakAnnotations <- annotatePeak(
+  atacGrcRanges,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+sigMethCpGAnnotations <- annotatePeak(
+  methSigGrcRanges,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+sigAtacPeakAnnotations <- annotatePeak(
+  atacSigGrcRanges,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+
+```
+
+# Section 4: Plot all the data
+
+``` {r}
+####                Sample subgroups - Mean and variance for Significant sites and Globally               ####
+ggplot(avgTopLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() + 
+  theme_minimal() +
+  labs(title = "Mean Methylation across Sample Subgroups (Top variant)", x = "Sample type", y = "Avg. Beta Value")
+ggplot(avgMethylationLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Mean Methylation across Sample Subgroup (Globally)", x = "Sample type", y = "Avg. Beta Value")
+ggplot(varLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Variances across Samples types for Methylation", x = "Sample type", y = "Beta Value")
+ggplot(varTopLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Top variance across Sample types for Methylation", x = "Sample Type", y = "Beta Value")
+ggplot(atacLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "ATAC-seq Mean and Variance per Peak", x = "Statistic",  y = "Beta Value")
+
+
+
+####                Mutual Samples - Mean and Variance for Significant sites and Globally               ####
+ggplot(mutAvgMethAll, aes(x = Group, y = AvgBeta, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Mean Methylation Globally and for significant sites of Common Samples", x = "Statistic",  y = "Beta Value")
+ggplot(mutVarMethAll, aes(x = Group, y = VarBeta, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Methylation Variance Globally and for significant sites of Common Samples", x = "Statistic",  y = "Beta Value")
+
+ggplot(mutAvgAtacAll, aes(x = Group, y = Value, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Average ATAC-seq Signal Across Peaks", x = "Peak Group", y = "Mean Accessibility")
+ggplot(mutVarAtacAll, aes(x = Group, y = Value, fill = Group)) +
+  geom_boxplot() + 
+  theme_minimal() +
+  labs(titlte = "Variant ATAC-seq Signal Across Peaks", x = "Peak Group", y = "Variance in Accessibility")
+
+
+
+####                 Annotation plots                     ####
+plotAnnoBar(methCpGAnnotations) + labs(title = "Global ProbeMap for (Beta)Methylation")
+plotAnnoBar(sigMethCpGAnnotations) + labs(title = "ProbeMap on Top significant CpG sites (Beta methylation) ")
+plotAnnoBar(atacPeakAnnotations) + labs(title = "Global ProbeMap for ATAC-seq")
+plotAnnoBar(sigAtacPeakAnnotations) + labs(title = "ProbeMap on Top significant Peaks (ATAC-seq)")
+```
