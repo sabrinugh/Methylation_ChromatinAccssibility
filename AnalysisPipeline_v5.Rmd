@@ -1,0 +1,941 @@
+---
+title: "AnalysisPipeline_v5"
+output: html_document
+date: "2025-08-6"
+description: "Reading in beta methylation and ATAC-seq data for preliminary analysis and overview of the data composition. Further finding the mean and most variant of global samples between the two data types, alongside the common samples between the data types. Get the annotations for positioning of the CpG sites/ATAC-seq peaks on the genome, and the locations of the most variant ones too. Using these annotations, plot the locations of these CpGs/peaks across the genome for all features (i.e. exons, introns, promoters etc.)"
+---
+## Set-up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ChIPseeker)
+library(ComplexHeatmap)
+library(ggplot2)
+library(tidyverse) # Re-organising data for plotting purposes
+library(data.table)
+library(GenomicDistributions)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene) # For ChIPseeker analysis
+library(org.Hs.eg.db) # For ChIPseeker analysis
+library(matrixStats)
+library(magick)
+library(circlize)
+library(readxl)
+```
+
+# Loading in raw data
+``` {r}
+# mem.maxVSize(1600000) # Increasing vector memory limit
+# Read in all necessary data - based on file path
+rawMethData <- fread("Data/TCGA-BRCA.methylation450.tsv")
+rawATACData <- fread("Data/brca-brca_peak_Log2Counts_dedup")
+
+methProbe <- read.delim("Data/HM450.hg38.manifest.gencode.v36.probeMap", sep='\t')
+atacProbe <- read.delim("Data/brca-brca_peak.probeMap", sep='\t')
+```
+
+--------
+
+## Section 1: Cleaning data values for analysis
+
+Methylation Values
+
+```{r}
+# Clean and sub-group sample types
+methData <- rawMethData[complete.cases(rawMethData), ]
+methCpGIDs <- methData[[1]]
+
+methCols <- colnames(methData); suffixes <- substr(methCols, nchar(methCols) - 3, nchar(methCols))
+primaryMeth <- methData[, suffixes %in% c("-01A", "-01B"), with = F]
+normalMeth <- methData[, suffixes %in% c("-11A", "-11B"), with = F]
+metastaticMeth <- methData[, suffixes %in% c("-06A", "-06B"), with = F]
+
+# Subset to find top variants
+methMatrix <- as.matrix(methData[, .SD, .SDcols = sapply(methData, is.numeric)])
+methVar <- rowVars(methMatrix, na.rm = T)
+methTopVarInd <- order(methVar, decreasing = T)[1:1000]
+methSigVar <- methVar[methTopVarInd]
+methSigCpGs <- methCpGIDs[methTopVarInd]
+
+varMethData <- methData[methCpGIDs %in% methSigCpGs, ]
+varMethMatrix <- as.matrix(varMethData[, .SD, .SDcols = sapply(varMethData, is.numeric)])
+
+# Mean global and top-variant site methylation
+avgPrimary <- rowMeans(primaryMeth)
+avgNormal <- rowMeans(normalMeth)
+avgMetastatic <- rowMeans(metastaticMeth)
+avgMethAll <- rowMeans(methMatrix)
+
+avgMethylationAll <- data.frame(
+  Primary = avgPrimary,
+  Normal = avgNormal,
+  Metastatic = avgMetastatic,
+  Global = avgMethAll
+)
+
+avgMethylationLong <- pivot_longer(avgMethylationAll, cols = everything(), names_to = "Group", values_to = "BetaValue") # Global mean methylation
+
+avgPrimaryTop <- rowMeans(varMethData[, suffixes %in% c("-01A", "-01B"), with = F])
+avgNormalTop <- rowMeans(varMethData[, suffixes %in% c("-11A", "-11B"), with = F])
+avgMetastaticTop <- rowMeans(varMethData[, suffixes %in% c("-06A", "-06B"), with = F])
+avgTopAll <- rowMeans(varMethMatrix, na.rm = T)
+
+avgTopMethylationAll <- data.frame(
+  Primary = avgPrimaryTop,
+  Normal = avgNormalTop,
+  Metastatic = avgMetastaticTop,
+  Global = avgTopAll
+)
+
+avgTopLong <- pivot_longer(avgTopMethylationAll, col = everything(), names_to = "Group", values_to = "BetaValue")
+
+varPrimary <- rowVars(as.matrix(primaryMeth))
+varNormal <- rowVars(as.matrix(normalMeth))
+varMetastatic <- rowVars(as.matrix(metastaticMeth))
+globalMethVars <- data.frame(
+  Primary = varPrimary,
+  Normal = varNormal,
+  Metastatic = varMetastatic,
+  Global = methVar
+)
+
+varLong <- pivot_longer(globalMethVars, col = everything(), names_to = "Group", values_to = "BetaValue")
+
+varPrimaryTop <- rowVars(as.matrix(varMethData[, suffixes %in% c("-01A", "-01B"), with = F]))
+varNormalTop <- rowVars(as.matrix(varMethData[, suffixes %in% c("-11A", "-11B"), with = F]))
+varMetastaticTop <- rowVars(as.matrix(varMethData[, suffixes %in% c("-06A", "-06B"), with = F]))
+globalTopMethVars <- data.frame(
+  Primary = varPrimaryTop,
+  Normal = varNormalTop,
+  Metastatic = varMetastaticTop,
+  Global = methSigVar
+)
+
+varTopLong <- pivot_longer(globalTopMethVars, col = everything(), names_to = "Group", values_to = "BetaValue")
+```
+
+ATAC-seq Values
+
+```{r}
+atacData <- rawATACData[complete.cases(rawATACData), ]
+peakIDs <- atacData[[1]]
+
+atacMatrix <- as.matrix(atacData[, .SD, .SDcols = sapply(atacData, is.numeric)])
+avgATAC <- rowMeans(atacMatrix, na.rm = T)
+varATAC <- rowVars(atacMatrix, na.rm = T)
+
+varATACTopInd <- order(varATAC, decreasing = T)[1:1000]
+varATACTop <- atacData[varATACTopInd, ]
+sigATACPeaks <- peakIDs[varATACTopInd]
+
+atacDF <- data.frame(
+  Peak = peakIDs,
+  Mean = avgATAC,
+  Variance = varATAC
+)
+
+atacLong <- pivot_longer(atacDF, cols = c("Mean", "Variance"), names_to = "Group", values_to = "BetaValue")
+```
+
+## Additional: Separate to find the correlation between the samples with both ATAC-seq and methylation data
+
+``` {r Doing the same above analysis for the samples in both the methylation and ATAC-seq data}
+# Ensure names are modified for continuity purposes
+colnames(methData)[1] <- "ids"
+colnames(atacData)[1] <- "ids"
+methSamples <- colnames(methData); atacSamples <- colnames(atacData)
+commonSamples <- intersect(methSamples, atacSamples)
+
+# Subset the datasets to retain only the common samples
+mutualMeth <- methData[, ..commonSamples]
+mutualATAC <- atacData[, ..commonSamples]
+colnames(mutualMeth)[1] <- "IDs"; colnames(mutualATAC)[1] <- "IDs"
+```
+
+``` {r Common Methylation}
+mutColnames <- colnames(mutualMeth); mutSuffixes <- substr(mutColnames, nchar(mutColnames) - 3, nchar(mutColnames))
+# Only primary tumour samples relevant as it's the only sample type shared with
+
+# Top variants of samples
+mutMethMat <- as.matrix(mutualMeth[, .SD, .SDcols = sapply(mutualMeth, is.numeric)])
+mutMethVar <- rowVars(mutMethMat, na.rm = T)
+mutTopVarInd <- order(mutMethVar, decreasing = T)[1:1000]
+mutMethSigVar <- mutMethVar[mutTopVarInd]
+mutMethSigCpG <- methCpGIDs[mutTopVarInd]
+
+mutVarSigMethData <- mutualMeth[methCpGIDs %in%  mutMethSigCpG, ]
+mutVarMethMatrix <- as.matrix(mutVarSigMethData[, .SD, .SDcols = sapply(mutVarSigMethData, is.numeric)])
+
+# Global avgs. for sample types
+avgMutPrimary <- rowMeans(mutualMeth)
+# Avg. for the top significant variances
+avgMutPrimaryTop <- rowMeans(mutVarSigMethData[, mutSuffixes %in% c("-01A", "-01B"), with = F])
+
+varMutPrimary <- rowVars(as.matrix(mutMethPrimary)) # Global variance
+varMutPrimaryTop <- rowVars(mutVarMethMatrix)
+
+mutAvgMethAll <- data.frame(
+  AvgBeta = c(avgMutPrimary, avgMutPrimaryTop),
+  Group = c(
+    rep("All CpGs", length(avgMutPrimary)),
+    rep("Top Variable CpGs", length(avgMutPrimaryTop))
+  )
+)
+
+mutVarMethAll <- data.frame(
+  VarBeta = c(varMutPrimary, varMutPrimaryTop),
+  Group = c(
+    rep("All CpGs", length(varMutPrimary)),
+    rep("Top Variable CpGs", length(varMutPrimaryTop))
+  )
+)
+```
+
+``` {r Common ATAC-seq}
+        # ATAC-seq analysis
+  #      varATACTop # Contains top variant atac-seq peaks
+  #      mutualATAC # mutual sample data of the atac-seq data
+        ## now need to subset `mutualATAC` to find the peaks of `varATACTop` - no need to subset sample type, know it's already primary tumour samples
+mutAtacMat <- as.matrix(mutualATAC[, .SD, .SDcols = sapply(mutualATAC, is.numeric)])
+
+# Global mean and variance of ATAC-seq data
+avgMutAtac <- rowMeans(mutAtacMat, na.rm = T) 
+varMutAtac <- rowVars(mutAtacMat, na.rm = T)
+
+mutVarAtacTopInd <- order(varMutAtac, decreasing = T)[1:1000]
+mutVarAtacTop <- mutualATAC[mutVarAtacTopInd, ]
+mutSigAtacPeaks <- peakIDs[mutVarAtacTopInd]
+
+mutVarAtacTopMat <- as.matrix(mutVarAtacTop[, .SD, .SDcols = sapply(mutVarAtacTop, is.numeric)])
+avgMutAtacTop <- rowMeans(mutVarAtacTopMat)# Global variance
+varMutAtacTop <- rowVars(mutVarAtacTopMat)
+
+mutAtacDF <- data.frame(
+  Mean = avgMutAtac,
+  Variance = varMutAtac
+)
+mutAtacTopDF <- data.frame(
+  Mean = avgMutAtacTop,
+  Variance = varMutAtacTop
+)
+
+mutAvgAtacAll <- data.frame(
+  Value = c(avgMutAtac, avgMutAtacTop),
+  Group = c(
+    rep("All CpGs", length(avgMutAtac)),
+    rep("Top Variable Peaks", length(avgMutAtacTop))
+  )
+)
+mutVarAtacAll <- data.frame(
+  Value = c(varMutAtac, varMutAtacTop),
+  Group = c(
+    rep("All Peaks", length(varMutAtac)),
+    rep("Top Variable Peaks", length(varMutAtacTop))
+  )
+)
+
+```
+
+--------
+
+## Section 2: Annotations
+
+``` {r}
+# Remove missing data rows
+methProbe <- methProbe[complete.cases(methProbe[, c("chrom", "chromStart", "chromEnd")]), ]
+atacProbe <- atacProbe[complete.cases(atacProbe[, c("chrom", "chromStart", "chromEnd")]), ]
+colnames(methProbe)[1] <- "id";colnames(atacProbe)[1] <- "id" #Rename for convention
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+methGrcRanges <- GRanges(
+  seqnames = methProbe$chrom,
+  ranges = IRanges(start = methProbe$chromStart, end = methProbe$chromEnd),
+  names = methProbe$id
+)
+atacGrcRanges <- GRanges(
+  seqnames = atacProbe$chrom,
+  ranges = IRanges(start = atacProbe$chromStart, end = atacProbe$chromEnd),
+  names = atacProbe$id
+)
+
+# Top variant significant CpG sites
+sigMethProbe <- methProbe[methProbe$id %in% methSignificantCpGs, ]
+sigATACProbe <- atacProbe[atacProbe$id %in% sigATACPeaks, ]
+
+methSigGrcRanges <- GRanges(
+  seqnames = sigMethProbe$chrom,
+  ranges = IRanges(start = sigMethProbe$chromStart, end = sigMethProbe$chromEnd),
+  names = sigMethProbe$id
+)
+atacSigGrcRanges <- GRanges(
+  seqnames = sigATACProbe$chrom,
+  ranges = IRanges(start = sigATACProbe$chromStart, end = sigATACProbe$chromEnd),
+  names = sigATACProbe$id
+)
+
+# Full annotations
+methCpGAnnotations <- annotatePeak(
+  methGrcRanges,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+atacPeakAnnotations <- annotatePeak(
+  atacGrcRanges,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+sigMethCpGAnnotations <- annotatePeak(
+  methSigGrcRanges,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+sigAtacPeakAnnotations <- annotatePeak(
+  atacSigGrcRanges,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+
+```
+
+## Section 3: Plot the preliminary analysis
+Plotting out the global means and variances of the methylation and ATAC-seq data. Additionally plot our annotations
+``` {r}
+####                Sample subgroups - Mean and variance for Significant sites and Globally               ####
+ggplot(avgTopLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() + 
+  theme_minimal() +
+  labs(title = "Mean Methylation across Sample Subgroups (Top variant)", x = "Sample type", y = "Avg. Beta Value")
+ggplot(avgMethylationLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Mean Methylation across Sample Subgroup (Globally)", x = "Sample type", y = "Avg. Beta Value")
+ggplot(varLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Variances across Samples types for Methylation", x = "Sample type", y = "Beta Value")
+ggplot(varTopLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Top variance across Sample types for Methylation", x = "Sample Type", y = "Beta Value")
+ggplot(atacLong, aes(x = Group, y = BetaValue, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "ATAC-seq Mean and Variance per Peak", x = "Statistic",  y = "Beta Value")
+
+
+
+####                Mutual Samples - Mean and Variance for Significant sites and Globally               ####
+ggplot(mutAvgMethAll, aes(x = Group, y = AvgBeta, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Mean Methylation Globally and for significant sites of Common Samples", x = "Statistic",  y = "Beta Value")
+ggplot(mutVarMethAll, aes(x = Group, y = VarBeta, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Methylation Variance Globally and for significant sites of Common Samples", x = "Statistic",  y = "Beta Value")
+
+ggplot(mutAvgAtacAll, aes(x = Group, y = Value, fill = Group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Average ATAC-seq Signal Across Peaks", x = "Peak Group", y = "Mean Accessibility")
+ggplot(mutVarAtacAll, aes(x = Group, y = Value, fill = Group)) +
+  geom_boxplot() + 
+  theme_minimal() +
+  labs(titlte = "Variant ATAC-seq Signal Across Peaks", x = "Peak Group", y = "Variance in Accessibility")
+
+
+
+####                 Annotation plots                     ####
+plotAnnoBar(methCpGAnnotations) + labs(title = "Global ProbeMap for (Beta)Methylation")
+plotAnnoBar(sigMethCpGAnnotations) + labs(title = "ProbeMap on Top significant CpG sites (Beta methylation) ")
+plotAnnoBar(atacPeakAnnotations) + labs(title = "Global ProbeMap for ATAC-seq")
+plotAnnoBar(sigAtacPeakAnnotations) + labs(title = "ProbeMap on Top significant Peaks (ATAC-seq)")
+```
+
+--------
+
+## Section 4: Methylation and ATAC-seq annotation subsetting
+Subsetting both data types to find the locations of CpG/peaks across the genome for individual features such as exons, introns, promoters etc.
+
+``` {r Methylation distribution of CpG sites across the genome for each feature}
+methAnno <- methCpGAnnotations@anno
+methAnnoRegions <- methAnno$annotation # Reassign to the annotations
+
+methIntrons     <- methAnno[grep("^Intron?", methAnnoRegions)]; cpgIntrons <- methIntrons$names
+methPromoters   <- methAnno[grep("^Promoter?", methAnnoRegions)]; cpgPromotors <- methPromoters$names
+methExons       <- methAnno[grep("^Exon?", methAnnoRegions)]; cpgExons <- methExons$names 
+methDistalInt   <- methAnno[grep("^Distal Intergenic?", methAnnoRegions)]; cpgDistalInt <- methDistalInt$names
+methUTR5        <- methAnno[grep("^5' UTR?", methAnnoRegions)]; cpgUTR5 <- methUTR5$names
+methUTR3        <- methAnno[grep("^3' UTR?", methAnnoRegions)]; cpgUTR3 <- methUTR3$names
+methDownstream  <- methAnno[grep("^Downstream?", methAnnoRegions)]; cpgDownstream <- methDownstream$names
+
+allMethGenomicRanges <- c(methIntrons, methExons, methPromoters, methDistalInt, methUTR3, methUTR5, methDownstream)
+
+# Removing chr Y for direct plotting comparison between ATAC-seq and methylation
+methAnnoRegionsEqual <- methAnno[seqnames(methAnno) != "chrY"]
+
+methIntronsEqual    <- methAnno[grep("^Introns?", methAnnoRegionsEqual$annotation)]
+methExonsEqual      <- methAnno[grep("^Exons?", methAnnoRegionsEqual$annotation)]
+methPromotersEqual  <- methAnno[grep("^Promoters?", methAnnoRegionsEqual$annotation)]
+methDownstreamEqual <- methAnno[grep("^Downstream?", methAnnoRegionsEqual$annotation)]
+methDistalIntEqual  <- methAnno[grep("^Distal Intergenic?", methAnnoRegionsEqual$annotation)]
+methUTR5Equal       <- methAnno[grep("^5' UTR?", methAnnoRegionsEqual$annotation)]
+methUTR3Equal       <- methAnno[grep("^3' UTR?", methAnnoRegionsEqual$annotation)]
+```
+
+``` {r ATAC-seq distribution of peaks across the genome for each feature}
+# Global distribution of features - not filtered for primary or specific samples
+atacAnno <- atacPeakAnnotations@anno
+atacAnnoRegions <- atacAnno$annotation # Reassign to the annotations
+
+atacIntrons     <- atacAnno[grep("^Intron?", atacAnnoRegions)]
+atacPromoters   <- atacAnno[grep("^Promoter?", atacAnnoRegions)]
+atacExons       <- atacAnno[grep("^Exon?", atacAnnoRegions)]
+atacDistalInt   <- atacAnno[grep("^Distal Intergenic?", atacAnnoRegions)]
+atacUTR5        <- atacAnno[grep("^5' UTR?", atacAnnoRegions)]
+atacUTR3        <- atacAnno[grep("^3' UTR?", atacAnnoRegions)]
+atacDownstream  <- atacAnno[grep("^Downstream?", atacAnnoRegions)]
+
+allAtacGenomicRanges <- c(atacIntrons, atacExons, atacPromoters, atacDistalInt, atacUTR3, atacUTR5, atacDownstream)
+```
+
+--------
+
+## Section 5: Plotting out Annotations via circos plots
+Utilising the 'circlize' library (reference accordingly)
+
+``` {r Comparison between methylation and ATAC-seq peak locations for a given genomic feature}
+featureComparisonCircos <- function(methFeatureGR, atacFeatureGR, featureName = "Feature") {
+  # Get common chromosome names
+  chroms <- intersect(unique(as.character(seqnames(methFeatureGR))),
+                      unique(as.character(seqnames(atacFeatureGR))))
+  
+  # Compute xlim per chromosome based on both datasets
+  xlimList <- lapply(chroms, function(chr) {
+    methChr <- methFeatureGR[seqnames(methFeatureGR) == chr]
+    atacChr <- atacFeatureGR[seqnames(atacFeatureGR) == chr]
+    all_starts <- c(start(methChr), start(atacChr))
+    all_ends   <- c(end(methChr), end(atacChr))
+    c(min(all_starts), max(all_ends))
+  })
+  xlim <- do.call(rbind, xlimList)
+  rownames(xlim) <- chroms
+  
+  # Initialize circos plot
+  circos.clear()
+  circos.par("track.height" = 0.1)
+  circos.initialize(factors = chroms, xlim = xlim)
+
+  circos.trackPlotRegion(
+    ylim = c(0, 1), panel.fun = function(x, y) {
+      chr <- CELL_META$sector.index
+      xcenter <- get.cell.meta.data("xcenter")
+      circos.text(xcenter, 1.2, chr, facing = "clockwise", niceFacing = TRUE, cex = 0.5)
+    },
+    track.height = 0.05, bg.border = NA
+  )
+  circos.trackHist(
+    factors = as.character(seqnames(methFeatureGR)),
+    x = start(methFeatureGR),
+    col = "skyblue",
+    track.height = 0.1
+  )
+  circos.trackHist(
+    factors = as.character(seqnames(atacFeatureGR)),
+    x = start(atacFeatureGR),
+    col = "tomato",
+    track.height = 0.1
+  )
+  
+  # Add legend
+  legend("topright", legend = c("Methylation", "ATAC-seq"),
+         fill = c("skyblue", "tomato"), border = NA, bty = "n", cex = 0.8)
+  
+  # Add main title
+  title(paste("Circos Plot of", featureName))
+}
+
+featureComparisonCircos(methIntronsEqual, atacIntrons, "Introns")
+featureComparisonCircos(methExonsEqual, atacExons, "Exons")
+featureComparisonCircos(methPromotersEqual, atacPromoters, "Promoters")
+featureComparisonCircos(methDistalIntEqual, atacDistalInt, "Distal Intergenic region")
+featureComparisonCircos(methUTR3Equal, atacUTR3, "3' UTR")
+featureComparisonCircos(methUTR5Equal, atacUTR5, "5' UTR")
+featureComparisonCircos(methDownstreamEqual, atacDownstream, "Downstream")
+```
+
+``` {r All genomic features for a given data type}
+circosAllFeatures <- function(allGenomicRanges, featureList, dataType = "datatype") {
+  factors <- as.character(seqnames(allGenomicRanges))
+  chroms <- unique(factors)
+  
+  xlimList <- lapply(chroms, function(chr) {
+    chrRanges <- allGenomicRanges[seqnames(allGenomicRanges) == chr]
+    c(min(start(chrRanges)), max(end(chrRanges)))
+  })
+  xlim <- do.call(rbind, xlimList)
+  rownames(xlim) <- chroms
+  
+  circos.clear()
+  circos.par(cell.padding = c(0.02, 0, 0.02, 0))
+  circos.initialize(factors = chroms, xlim = xlim)
+  circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
+    chr <- CELL_META$sector.index
+    xcenter <- mean(CELL_META$xlim)
+    circos.text(x = xcenter, y = 0.5, labels = chr,
+                facing = "clockwise", niceFacing = TRUE,
+                adj = c(0, 0.5), cex = 0.6)
+  }, track.height = 0.05, bg.border = NA) ## Adding labels to the chromosomes
+  defaultColors <- c("Introns" = "navy", 
+                     "Exons" = "orange", 
+                     "Promoters" = "darkred", 
+                     "Distal Intergenic" = "green4", 
+                     "3' UTR" = "maroon", 
+                     "5' UTR" = "coral", 
+                     "Downstream" = "lightslateblue")
+
+  # Loop through feature list and add histograms
+  for (featureName in names(featureList)) {
+    featureGR <- featureList[[featureName]]
+    circos.trackHist(
+      factors = as.character(seqnames(featureGR)),
+      x = start(featureGR),
+      col = defaultColors[featureName],
+      track.height = 0.1
+    )
+  }
+  legend("right",
+         legend = names(featureList),
+         fill = defaultColors[names(featureList)],
+         border = NA,
+         bty = "n", cex = 0.8)
+  title(paste("Peak Distribution in Genomic Features for ", dataType))
+}
+
+atacFeatureList <- list(
+  "Introns" = atacIntrons,
+  "Exons" = atacExons,
+  "Promoters" = atacPromoters,
+  "Distal Intergenic" = atacDistalInt,
+  "3' UTR" = atacUTR3,
+  "5' UTR" = atacUTR5,
+  "Downstream" = atacDownstream
+)
+methFeatureList <- list(
+  "Introns" = methIntrons,
+  "Exons" = methExons,
+  "Promoters" = methPromoters,
+  "Distal Intergenic" = methDistalInt,
+  "3' UTR" = methUTR3,
+  "5' UTR" = methUTR5,
+  "Downstream" = methDownstream
+)
+
+circosAllFeatures(allAtacGenomicRanges, atacFeatureList, "ATAC-seq")
+circosAllFeatures(allMethGenomicRanges, methFeatureList, "Methylation data")
+```
+
+--------
+
+## Section 6: Methylation and Accessibility and varying points of distribution
+Based on the chromosomal distribution of features on both methylation and ATAC-seq data, find the areas with the highest/lowest presence of sites and calculate the mean/median/variance of the methylation or chromatin accessibility value itself for the region.
+
+``` {r Subsetting for features in all the common methylation and ATAC-seq data}
+samples <- commonSamples[-1]
+# Using the methylation data that excludes chr Y, as this chr isn't available on the ATAC-seq data - makes further plotting later easier
+
+# Introns
+mutualMethIntrons <- mutualMeth[methCpGIDs %in% methIntronsEqual$names, ] 
+mutualMethIntronsMatrix <- as.matrix(mutualMethIntrons[, .SD, .SDcols = sapply(mutualMethIntrons, is.numeric)])
+mutualAtacIntrons <- mutualATAC[peakIDs %in% atacIntrons$names, ]
+mutualAtacIntronsMatrix <- as.matrix(mutualAtacIntrons[, .SD, .SDcols = sapply(mutualAtacIntrons, is.numeric)])
+
+# Exons
+mutualMethExons <- mutualMeth[methCpGIDs %in% methExonsEqual$names, ]
+mutualMethExonsMatrix <- as.matrix(mutualMethExons[, .SD, .SDcols = sapply(mutualMethExons, is.numeric)])
+mutualAtacExons <- mutualATAC[peakIDs %in% atacExons$names, ]
+mutualAtacExonsMatrix <- as.matrix(mutualAtacExons[, .SD, .SDcols = sapply(mutualAtacExons, is.numeric)])
+
+# Promoters
+mutualMethPromoters <- mutualMeth[methCpGIDs %in% methPromotersEqual$names, ]
+mutualMethPromotersMatrix <- as.matrix(mutualMethPromoters[, .SD, .SDcols = sapply(mutualMethPromoters, is.numeric)])
+mutualAtacPromoters <- mutualATAC[peakIDs %in% atacPromoters$names, ]
+mutualAtacPromotersMatrix <- as.matrix(mutualAtacPromoters[, .SD, .SDcols = sapply(mutualAtacPromoters, is.numeric)])
+
+# Distal Intergenic Region
+mutualMethDistalInt <- mutualMeth[methCpGIDs %in% methDistalIntEqual$names, ]
+mutualMethDistalIntMatrix <- as.matrix(mutualMethDistalInt[, .SD, .SDcols = sapply(mutualMethDistalInt, is.numeric)])
+mutualAtacDistalInt <- mutualATAC[peakIDs %in% atacDistalInt$names, ]
+mutualAtacDistalIntMatrix <- as.matrix(mutualAtacDistalInt[, .SD, .SDcols = sapply(mutualAtacDistalInt, is.numeric)])
+
+# UTRs (5' and 3')
+mutualMethUTR3 <- mutualMeth[methCpGIDs %in% methUTR3Equal$names, ]
+mutualMethUTR3Matrix <- as.matrix(mutualMethUTR3[, .SD, .SDcols = sapply(mutualMethUTR3, is.numeric)])
+mutualAtacUTR3 <- mutualATAC[peakIDs %in% atacUTR3$names, ]
+mutualAtacUTR3Matrix <- as.matrix(mutualAtacUTR3[, .SD, .SDcols = sapply(mutualAtacUTR3, is.numeric)])
+
+mutualMethUTR5 <- mutualMeth[methCpGIDs %in% methUTR5Equal$names, ]
+mutualMethUTR5Matrix <- as.matrix(mutualMethUTR5[, .SD, .SDcols = sapply(mutualMethUTR5, is.numeric)])
+mutualAtacUTR5 <- mutualATAC[peakIDs %in% atacUTR5$names, ]
+mutualAtacUTR5Matrix <- as.matrix(mutualAtacUTR5[, .SD, .SDcols = sapply(mutualAtacUTR5, is.numeric)])
+
+# Downstream
+mutualMethDownstream <- mutualMeth[methCpGIDs %in% methDownstreamEqual$names, ]
+mutualMethDownstreamMatrix <- as.matrix(mutualMethDownstream[, .SD, .SDcols = sapply(mutualMethDownstream, is.numeric)])
+mutualAtacDownstream <- mutualATAC[peakIDs %in% atacDownstream$names, ]
+mutualAtacDownstreamMatrix <- as.matrix(mutualAtacDownstream[, .SD, .SDcols = sapply(mutualAtacDownstream, is.numeric)])
+```
+
+``` {r Mean methylation and chromatin accessibility for all features (for common samples)}
+# Introns
+avgMethIntrons <- rowMeans(mutualMethIntronsMatrix); avgAtacIntrons <- rowMeans(mutualAtacIntronsMatrix)
+
+# Exons
+avgMethExons <- rowMeans(mutualMethExonsMatrix); avgAtacExons <- rowMeans(mutualAtacExonsMatrix)
+
+# Promoters
+avgMethPromoters <- rowMeans(mutualMethPromotersMatrix); avgAtacPromoters <- rowMeans(mutualAtacPromotersMatrix)
+
+# Distal Intergenic Region
+avgMethDistalInt <- rowMeans(mutualMethDistalIntMatrix); avgAtacDistalInt <- rowMeans(mutualAtacDistalIntMatrix)
+
+# UTRs (5' and 3')
+avgMethUTR3 <- rowMeans(mutualMethUTR3Matrix); avgAtacUTR3 <- rowMeans(mutualAtacUTR3Matrix)
+avgMethUTR5 <- rowMeans(mutualMethUTR5Matrix); avgAtacUTR5 <- rowMeans(mutualAtacUTR5Matrix)
+
+# Downstream
+avgMethDownstream <- rowMeans(mutualMethDownstreamMatrix); avgAtacDownstream <- rowMeans(mutualAtacDownstreamMatrix)
+```
+
+``` {r Reassignment of mean to the corresponding sites/peaks}
+# This section reassigns the average methylation values back to the original site, while leaving 0 values in the sections that may not appear in the mutual samples
+
+# Introns
+methIntronsCpGs <- methIntronsEqual$names; atacIntronsPeaks <- atacIntrons$names
+matchedAvgMethIntrons <- setNames(rep(0, length(methIntronsCpGs)), methIntronsCpGs)
+matchedAvgMethIntrons[mutualMethIntrons$IDs] <- avgMethIntrons
+matchedAvgAtacIntrons <- setNames(rep(0, length(atacIntronsPeaks)), atacIntronsPeaks)
+matchedAvgAtacIntrons[mutualAtacIntrons$IDs] <- avgAtacIntrons
+
+# Exons
+methExonsCpGs <- methExonsEqual$names; atacExonsPeaks <- atacExons$names
+matchedAvgMethExons <- setNames(rep(0, length(methExonsCpGs)), methExonsCpGs)
+matchedAvgMethExons[mutualMethExons$IDs] <- avgMethExons
+matchedAvgAtacExons <- setNames(rep(0, length(atacExonsPeaks)), atacExonsPeaks)
+matchedAvgAtacExons[mutualAtacExons$IDs] <- avgAtacExons
+
+# Promoters
+methPromotersCpGs <- methPromotersEqual$names; atacPromotersPeaks <- atacPromoters$names
+matchedAvgMethPromoters <- setNames(rep(0, length(methPromotersCpGs)), methPromotersCpGs)
+matchedAvgMethPromoters[mutualMethPromoters$IDs] <- avgMethPromoters
+matchedAvgAtacPromoters <- setNames(rep(0, length(atacPromotersPeaks)), atacPromotersPeaks)
+matchedAvgAtacPromoters[mutualAtacPromoters$IDs] <- avgAtacPromoters
+
+# Distal Intergenic (DistalInt)
+methDistalIntCpGs <- methDistalIntEqual$names; atacDistalIntPeaks <- atacDistalInt$names
+matchedAvgMethDistalInt <- setNames(rep(0, length(methDistalIntCpGs)), methDistalIntCpGs)
+matchedAvgMethDistalInt[mutualMethDistalInt$IDs] <- avgMethDistalInt
+matchedAvgAtacDistalInt <- setNames(rep(0, length(atacDistalIntPeaks)), atacDistalIntPeaks)
+matchedAvgAtacDistalInt[mutualAtacDistalInt$IDs] <- avgAtacDistalInt
+
+# UTRs ('3 and '5)
+methUTR3CpGs <- methUTR3Equal$names; atacUTR3Peaks <- atacUTR3$names
+matchedAvgMethUTR3 <- setNames(rep(0, length(methUTR3CpGs)), methUTR3CpGs)
+matchedAvgMethUTR3[mutualMethUTR3$IDs] <- avgMethUTR3
+matchedAvgAtacUTR3 <- setNames(rep(0, length(atacUTR3Peaks)), atacUTR3Peaks)
+matchedAvgAtacUTR3[mutualAtacUTR3$IDs] <- avgAtacUTR3
+
+methUTR5CpGs <- methUTR5Equal$names; atacUTR5Peaks <- atacUTR5$names
+matchedAvgMethUTR5 <- setNames(rep(0, length(methUTR5CpGs)), methUTR5CpGs)
+matchedAvgMethUTR5[mutualMethUTR5$IDs] <- avgMethUTR5
+matchedAvgAtacUTR5 <- setNames(rep(0, length(atacUTR5Peaks)), atacUTR5Peaks)
+matchedAvgAtacUTR5[mutualAtacUTR5$IDs] <- avgAtacUTR5
+
+# Downstream
+methDownstreamCpGs <- methDownstreamEqual$names; atacDownstreamPeaks <- atacDownstream$names
+matchedAvgMethDownstream <- setNames(rep(0, length(methDownstreamCpGs)), methDownstreamCpGs)
+matchedAvgMethDownstream[mutualMethDownstream$IDs] <- avgMethDownstream
+matchedAvgAtacDownstream <- setNames(rep(0, length(atacDownstreamPeaks)), atacDownstreamPeaks)
+matchedAvgAtacDownstream[mutualAtacDownstream$IDs] <- avgAtacDownstream
+
+
+# Add the averages into the GRange obects for all the features
+# all(methIntrons$names == names(matchedAvgMethIntrons)) # Ensure all the names match up
+mcols(methIntronsEqual)$avgMeth <- matchedAvgMethIntrons
+mcols(atacIntrons)$avgATAC <- matchedAvgAtacIntrons
+
+mcols(methExonsEqual)$avgMeth <- matchedAvgMethExons
+mcols(atacExons)$avgATAC <- matchedAvgAtacExons
+
+mcols(methPromotersEqual)$avgMeth <- matchedAvgMethPromoters
+mcols(atacPromoters)$avgATAC <- matchedAvgAtacPromoters
+
+mcols(methDistalIntEqual)$avgMeth <- matchedAvgMethDistalInt
+mcols(atacDistalInt)$avgATAC <- matchedAvgAtacDistalInt
+
+mcols(methUTR3Equal)$avgMeth <- matchedAvgMethUTR3
+mcols(atacUTR3)$avgATAC <- matchedAvgAtacUTR3
+
+mcols(methUTR5Equal)$avgMeth <- matchedAvgMethUTR5
+mcols(atacUTR5)$avgATAC <- matchedAvgAtacUTR5
+
+mcols(methDownstreamEqual)$avgMeth <- matchedAvgMethDownstream
+mcols(atacDownstream)$avgATAC <- matchedAvgAtacDownstream
+```
+
+### Function to circos plot out the avg value of activity at a site, for individual features across the genome
+``` {r Circos Plot function - Dealing with values rather than count compared to previous function}
+featureComparisonCircosValues <- function(methFeatureGR, atacFeatureGR, featureName = "Feature") {
+  chroms <- intersect(unique(as.character(seqnames(methFeatureGR))),
+                      unique(as.character(seqnames(atacFeatureGR))))
+  
+  # Compute xlim per chromosome based on both datasets
+  xlimList <- lapply(chroms, function(chr) {
+    methChr <- methFeatureGR[seqnames(methFeatureGR) == chr]
+    atacChr <- atacFeatureGR[seqnames(atacFeatureGR) == chr]
+    all_starts <- c(start(methChr), start(atacChr))
+    all_ends   <- c(end(methChr), end(atacChr))
+    c(min(all_starts), max(all_ends))
+  })
+  xlim <- do.call(rbind, xlimList)
+  rownames(xlim) <- chroms
+  
+  # Initialize circos plot
+  circos.clear()
+  circos.par("track.height" = 0.1)
+  circos.initialize(factors = chroms, xlim = xlim)
+  circos.trackPlotRegion(
+    ylim = c(0, 1), panel.fun = function(x, y) {
+      chr <- CELL_META$sector.index
+      xcenter <- get.cell.meta.data("xcenter")
+      circos.text(xcenter, 1.2, chr, facing = "clockwise", niceFacing = TRUE, cex = 0.5)
+    },
+    track.height = 0.1, bg.border = NA
+  )
+  
+  circos.track(
+    factors = as.character(as.vector(seqnames(methFeatureGR))),
+    x = start(methFeatureGR),
+    y = mcols(methFeatureGR)$avgMeth,
+    panel.fun = function(x, y) {
+      circos.points(x, y, col = "skyblue", pch = 16, cex = 0.1)
+    },
+    track.height = 0.3
+  )
+  
+  circos.track(
+    factors = as.character(as.vector(seqnames(atacFeatureGR))),
+    x = start(atacFeatureGR),
+    y = mcols(atacFeatureGR)$avgATAC,
+    panel.fun = function(x, y) {
+      circos.points(x, y, col = "tomato", pch = 16, cex = 0.1)
+    },
+    track.height = 0.3
+  )
+  
+  # Add legend
+  legend("topright", legend = c("Methylation", "ATAC-seq"),
+         fill = c("skyblue", "tomato"), border = NA, bty = "n", cex = 0.8)
+  
+  # Add main title
+  title(paste("Circos Plot of", featureName))
+}
+```
+
+``` {r Call function plots}
+layout(matrix(1:4, 1, 4))
+featureComparisonCircosValues(methIntronsEqual, atacIntrons, "Introns")
+featureComparisonCircosValues(methExonsEqual, atacExons, "Exons")
+featureComparisonCircosValues(methPromotersEqual, atacPromoters, "Promoters")
+featureComparisonCircosValues(methDistalIntEqual, atacDistalInt, "Distal Int")
+
+layout(matrix(1:4, 2,2))
+featureComparisonCircosValues(methUTR3Equal, atacUTR3, "3' UTR")
+featureComparisonCircosValues(methUTR5Equal, atacUTR5, "5' UTR")
+featureComparisonCircosValues(methDownstreamEqual, atacDownstream, "Downstream")
+```
+
+#### TEST NORMAL SAMPLES
+
+``` {r Normal sample methylation}
+normalMeth$IDs <- methCpGIDs
+normalMethIntrons <- normalMeth[methCpGIDs %in% methIntronsEqual$names, ] 
+normalMethIntronsMatrix <- as.matrix(normalMethIntrons[, .SD, .SDcols = sapply(normalMethIntrons, is.numeric)])
+
+normalMethExons <- normalMeth[methCpGIDs %in% methExonsEqual$names, ] 
+normalMethExonsMatrix <- as.matrix(normalMethExons[, .SD, .SDcols = sapply(normalMethExons, is.numeric)])
+
+normalMethPromoters <- normalMeth[methCpGIDs %in% methPromotersEqual$names, ] 
+normalMethPromotersMatrix <- as.matrix(normalMethPromoters[, .SD, .SDcols = sapply(normalMethPromoters, is.numeric)])
+
+normalMethDistalInt <- normalMeth[methCpGIDs %in% methDistalIntEqual$names, ] 
+normalMethDistalIntMatrix <- as.matrix(normalMethDistalInt[, .SD, .SDcols = sapply(normalMethDistalInt, is.numeric)])
+
+normalMethUTR3 <- normalMeth[methCpGIDs %in% methUTR3Equal$names, ] 
+normalMethUTR3Matrix <- as.matrix(normalMethUTR3[, .SD, .SDcols = sapply(normalMethUTR3, is.numeric)])
+
+normalMethUTR5 <- normalMeth[methCpGIDs %in% methUTR5Equal$names, ] 
+normalMethUTR5Matrix <- as.matrix(normalMethUTR5[, .SD, .SDcols = sapply(normalMethUTR5, is.numeric)])
+
+normalMethDownstream <- normalMeth[methCpGIDs %in% methDownstreamEqual$names, ] 
+normalMethDownstreamMatrix <- as.matrix(normalMethDownstream[, .SD, .SDcols = sapply(normalMethDownstream, is.numeric)])
+
+
+normalMeanIntrons <- rowMeans(normalMethIntronsMatrix)
+normalMeanExons <- rowMeans(normalMethExonsMatrix)
+normalMeanPromoters <- rowMeans(normalMethPromotersMatrix)
+normalMeanDistalInt <- rowMeans(normalMethDistalIntMatrix)
+normalMeanUTR3 <- rowMeans(normalMethUTR3Matrix)
+normalMeanUTR5 <- rowMeans(normalMethUTR5Matrix)
+normalMeanDownstream <- rowMeans(normalMethDownstreamMatrix)
+
+normalIntronsMean <- setNames(rep(0, length(methIntronsCpGs)), methIntronsCpGs)
+normalIntronsMean[normalMethIntrons$IDs] <- normalMeanIntrons
+normalExonsMean <- setNames(rep(0, length(methExonsCpGs)), methExonsCpGs)
+normalExonsMean[normalMethExons$IDs] <- normalMeanExons
+normalPromotersMean <- setNames(rep(0, length(methPromotersCpGs)), methPromotersCpGs)
+normalPromotersMean[normalMethPromoters$IDs] <- normalMeanPromoters
+normalDistalIntMean <- setNames(rep(0, length(methDistalIntCpGs)), methDistalIntCpGs)
+normalDistalIntMean[normalMethDistalInt$IDs] <- normalMeanDistalInt
+normalUTR3Mean <- setNames(rep(0, length(methUTR3CpGs)), methUTR3CpGs)
+normalUTR3Mean[normalMethUTR3$IDs] <- normalMeanUTR3
+normalUTR5Mean <- setNames(rep(0, length(methUTR5CpGs)), methUTR5CpGs)
+normalUTR5Mean[normalMethUTR5$IDs] <- normalMeanUTR5
+normalDownstreamMean <- setNames(rep(0, length(methDownstreamCpGs)), methDownstreamCpGs)
+normalDownstreamMean[normalMethDownstream$IDs] <- normalMeanDownstream
+
+normalIntrons <- methIntronsEqual
+normalExons <- methExonsEqual
+normalPromoters <- methPromotersEqual
+normalDistalInt <- methDistalIntEqual
+normalUTR3 <- methUTR3Equal
+normalUTR5 <- methUTR5Equal
+normalDownstream <- methDownstreamEqual
+
+mcols(normalIntrons)$avgMeth <- normalIntronsMean
+mcols(normalExons)$avgMeth <- normalExonsMean
+mcols(normalPromoters)$avgMeth <- normalPromotersMean
+mcols(normalDistalInt)$avgMeth <- normalDistalIntMean
+mcols(normalUTR3)$avgMeth <- normalUTR3Mean
+mcols(normalUTR5)$avgMeth <- normalUTR5Mean
+mcols(normalDownstream)$avgMeth <- normalDownstreamMean
+```
+
+``` {r Normal methylation plotting}
+featureNormalCircosValues <- function(methFeatureGR, featureName = "Feature") {
+  factors <- as.character(seqnames(methFeatureGR))
+  chroms <- unique(factors)
+  
+  # Compute xlim per chromosome based on both datasets
+  xlimList <- lapply(chroms, function(chr) {
+    chrRanges <- methFeatureGR[seqnames(methFeatureGR) == chr]
+    c(min(start(chrRanges)), max(end(chrRanges)))
+  })
+  xlim <- do.call(rbind, xlimList)
+  rownames(xlim) <- chroms
+  
+  # Initialize circos plot
+  circos.clear()
+  circos.par("track.height" = 0.1)
+  circos.initialize(factors = chroms, xlim = xlim)
+  circos.trackPlotRegion(
+    ylim = c(0, 1), panel.fun = function(x, y) {
+      chr <- CELL_META$sector.index
+      xcenter <- get.cell.meta.data("xcenter")
+      circos.text(xcenter, 1.2, chr, facing = "clockwise", niceFacing = TRUE, cex = 0.5)
+    },
+    track.height = 0.1, bg.border = NA
+  )
+  
+  circos.track(
+    factors = as.character(as.vector(seqnames(methFeatureGR))),
+    x = start(methFeatureGR),
+    y = mcols(methFeatureGR)$avgMeth,
+    panel.fun = function(x, y) {
+      circos.points(x, y, col = "skyblue", pch = 16, cex = 0.1)
+    },
+    track.height = 0.3
+  )
+  
+  # Add main title
+  title(paste("Circos Plot of Normal Sample Averages of: ", featureName))
+}
+
+```
+
+## Overlay Methylation and ATAC-seq means on the genome
+
+``` {r Overlaying for easier comparison}
+featureComparisonCircosValuesOverlay <- function(methFeatureGR, atacFeatureGR, featureName = "Feature") {
+  chroms <- intersect(unique(as.character(seqnames(methFeatureGR))),
+                      unique(as.character(seqnames(atacFeatureGR))))
+  
+  # Compute xlim per chromosome based on both datasets
+  xlimList <- lapply(chroms, function(chr) {
+    methChr <- methFeatureGR[seqnames(methFeatureGR) == chr]
+    atacChr <- atacFeatureGR[seqnames(atacFeatureGR) == chr]
+    all_starts <- c(start(methChr), start(atacChr))
+    all_ends   <- c(end(methChr), end(atacChr))
+    c(min(all_starts), max(all_ends))
+  })
+  xlim <- do.call(rbind, xlimList)
+  rownames(xlim) <- chroms
+  normalize_minmax <- function(x) (x - min(x, na.rm=TRUE)) / (max(x, na.rm=TRUE) - min(x, na.rm=TRUE))
+  mcols(methFeatureGR)$avgMethNorm <- normalize_minmax(mcols(methFeatureGR)$avgMeth)
+  mcols(atacFeatureGR)$avgATACNorm <- normalize_minmax(mcols(atacFeatureGR)$avgATAC)
+
+  # Initialize circos plot
+  circos.clear()
+  circos.par("track.height" = 0.1)
+  circos.initialize(factors = chroms, xlim = xlim)
+  circos.trackPlotRegion(
+    ylim = c(0, 1), panel.fun = function(x, y) {
+      chr <- CELL_META$sector.index
+      xcenter <- get.cell.meta.data("xcenter")
+      circos.text(xcenter, 1.2, chr, facing = "clockwise", niceFacing = TRUE, cex = 0.5)
+    },
+    track.height = 0.1, bg.border = NA
+  )
+  
+  circos.track(
+    ylim = c(0,1),
+    panel.fun = function(region, value, ...) {
+      chr <- CELL_META$sector.index
+      
+      methChr <- methFeatureGR[seqnames(methFeatureGR) == chr]
+      if (length(methChr) > 0) {
+        circos.points(start(methChr), mcols(methChr)$avgMethNorm, col = "blue", pch = 16, cex = 0.1)
+      }
+      atacChr <- atacFeatureGR[seqnames(atacFeatureGR) == chr]
+      if (length(atacChr) > 0) {
+        circos.points(start(atacChr), mcols(atacChr)$avgATACNorm, col = adjustcolor("tomato", alpha.f = 0.5), pch = 16, cex = 0.1)
+      }
+    },
+    track.height = 0.3
+  )
+  
+  # Add legend
+  legend("topright", legend = c("Methylation", "ATAC-seq"),
+         fill = c("blue", "tomato"), border = NA, bty = "n", cex = 0.8)
+  
+  # Add main title
+  title(paste("Circos Plot of", featureName))
+}
+```
+
+``` {r Plotting overlay circos}
+featureComparisonCircosValuesOverlay(methIntronsEqual, atacIntrons, "Introns")
+featureComparisonCircosValuesOverlay(methExonsEqual, atacExons, "Exons")
+
+featureComparisonCircosValuesOverlay(methPromotersEqual, atacPromoters, "Promoters")
+featureComparisonCircosValuesOverlay(methDistalIntEqual, atacDistalInt, "Distal Intergenic")
+
+featureComparisonCircosValuesOverlay(methUTR3Equal, atacUTR3, "3' UTR")
+featureComparisonCircosValuesOverlay(methUTR5Equal, atacUTR5, "5' UTR")
+
+featureComparisonCircosValuesOverlay(methDownstreamEqual, atacDownstream, "Downstream")
+```
+
+
+
