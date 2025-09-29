@@ -1,0 +1,297 @@
+---
+title: "PanCan"
+output: html_document
+date: "2025-08-28"
+---
+
+```{r} 
+mem.maxVSize(1600000)
+LUSCData <- fread("Data/TCGA-LUSC.methylation450.tsv") # Two warnings about missing ends of files so a cpg site has been missed for both lung cancers
+LUADData <- fread("Data/TCGA-LUAD.methylation450.tsv")
+ATACPanData <- fread("Data/TCGA_ATAC_peak_Log2Counts_dedup_sample")  
+
+LUSCProbeData <- read.delim("Data/LUSC_Meth.probeMap")
+LUADProbeData <- read.delim("Data/LUAD_Meth_probeMap")
+ATACProbeData <- read.delim("Data/TCGA_ATAC_peak.all.probeMap", sep = "\t")
+
+lungSamples <- read_excel("Data/ATAC_DonorsAndStats_v4.xlsx", sheet = "Lung")[,c(1, 3)]
+
+luscData <- LUSCData[complete.cases(LUSCData), ] # Clean to remove rows with N/A values
+luadData <- LUADData[complete.cases(LUADData), ]
+```
+
+# Data values/counts for Methylation and ATAC-seq data
+```{r Clean both types of Lung cancer data, before subsetting them to find the samples that also have ATAC-seq}
+samples <- lungSamples[[1]] # Samples that have both ATAC-seq and Meth (mutualSamples)
+
+colnames(luscData) <- sub("-01A$", "", colnames(luscData)); colnames(luadData) <- sub("-01A$", "", colnames(luadData))
+colnames(luadData)[1] <- "IDs"; colnames(luscData)[1] <- "IDs"
+
+luadMeth <- luadData[, c("IDs", intersect(colnames(luadData), samples)), with = F]
+luscMeth <- luscData[, c("IDs", intersect(colnames(luscData), samples)), with = F]
+commonSites <- intersect(luadMeth$IDs, luscMeth$IDs)
+luadMeth <- luadMeth[match(commonSites, luadMeth$IDs), ]
+luscMeth <- luscMeth[match(commonSites, luscMeth$IDs), ]
+
+
+# ATAC-seq Data cleaning
+colnames(ATACPanData) <- sub("-01A$", "", colnames(ATACPanData))
+panPeaks <- ATACPanData[[1]]
+luscPeaks <- panPeaks[grep("LUSC", panPeaks)]
+luadPeaks <- panPeaks[grep("LUAD", panPeaks)]
+
+luadAtac <- ATACPanData[sample %in% luadPeaks, ]
+luscAtac <- ATACPanData[sample %in% luscPeaks, ]
+colnames(luadAtac)[1] <- "IDs"; colnames(luscAtac)[1] <- "IDs"
+```
+
+# Annotations
+```{r}
+LUSCProbeData <- LUSCProbeData[complete.cases(LUSCProbeData[, c("chrom", "chromStart", "chromEnd")]), ]
+LUADProbeData <- LUADProbeData[complete.cases(LUADProbeData[, c("chrom", "chromStart", "chromEnd")]), ]
+ATACProbeData <- ATACProbeData[complete.cases(ATACProbeData[, c("chrom", "chromStart", "chromEnd")]), ]
+
+luadGRange <- GRanges(
+  seqnames = LUADProbeData$chrom,
+  ranges = IRanges(start = LUADProbeData$chromStart, end = LUADProbeData$chromEnd),
+  names = LUADProbeData$X.id
+)
+luscGRange <- GRanges(
+  seqnames = LUADProbeData$chrom,
+  ranges = IRanges(start = LUADProbeData$chromStart, end = LUADProbeData$chromEnd),
+  names = LUADProbeData$X.id
+)
+panGRange <- GRanges(
+  seqnames = ATACProbeData$chrom,
+  ranges = IRanges(start = ATACProbeData$chromStart, end = ATACProbeData$chromEnd),
+  names = ATACProbeData$id
+)
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+luadCpGAnnotations <- annotatePeak(
+  luadGRange,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+luscCpGAnnotations <- annotatePeak(
+  luscGRange,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+panCanAnnotations <- annotatePeak(
+  panGRange,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+
+```
+
+# Feature Annotations
+```{r}
+# Sorting out the features responsible in both ATAC-seq and methylation
+## TCGA-LUSC
+## --- TCGA-LUSC methylation annotations ---
+luscAnno <- luscCpGAnnotations@anno
+luscAnnoRegions <- luscAnno$annotation
+
+luscMethIntrons     <- luscAnno[grep("^Intron?", luscAnnoRegions)];       luscIntronsMethCpGs    <- luscMethIntrons$names
+luscMethPromoters   <- luscAnno[grep("^Promoter?", luscAnnoRegions)];     luscPromotersMethCpGs  <- luscMethPromoters$names
+luscMethExons       <- luscAnno[grep("^Exon?", luscAnnoRegions)];         luscExonsMethCpGs      <- luscMethExons$names 
+luscMethDistalInt   <- luscAnno[grep("^Distal Intergenic?", luscAnnoRegions)]; luscDistalIntMethCpGs <- luscMethDistalInt$names
+luscMethUTR5        <- luscAnno[grep("^5' UTR?", luscAnnoRegions)];       luscUTR5MethCpGs       <- luscMethUTR5$names
+luscMethUTR3        <- luscAnno[grep("^3' UTR?", luscAnnoRegions)];       luscUTR3MethCpGs       <- luscMethUTR3$names
+luscMethDownstream  <- luscAnno[grep("^Downstream?", luscAnnoRegions)];   luscDownstreamMethCpGs <- luscMethDownstream$names
+
+## --- TCGA-LUAD methylation annotations ---
+luadAnno <- luadCpGAnnotations@anno
+luadAnnoRegions <- luadAnno$annotation
+
+luadMethIntrons     <- luadAnno[grep("^Intron?", luadAnnoRegions)];       luadIntronsMethCpGs    <- luadMethIntrons$names
+luadMethPromoters   <- luadAnno[grep("^Promoter?", luadAnnoRegions)];     luadPromotersMethCpGs  <- luadMethPromoters$names
+luadMethExons       <- luadAnno[grep("^Exon?", luadAnnoRegions)];         luadExonsMethCpGs      <- luadMethExons$names 
+luadMethDistalInt   <- luadAnno[grep("^Distal Intergenic?", luadAnnoRegions)]; luadDistalIntMethCpGs <- luadMethDistalInt$names
+luadMethUTR5        <- luadAnno[grep("^5' UTR?", luadAnnoRegions)];       luadUTR5MethCpGs       <- luadMethUTR5$names
+luadMethUTR3        <- luadAnno[grep("^3' UTR?", luadAnnoRegions)];       luadUTR3MethCpGs       <- luadMethUTR3$names
+luadMethDownstream  <- luadAnno[grep("^Downstream?", luadAnnoRegions)];   luadDownstreamMethCpGs <- luadMethDownstream$names
+
+## --- ATAC-seq annotations ---
+panAnno <- panCanAnnotations@anno
+panAnnoRegions <- panAnno$annotation
+
+panAtacIntrons     <- panAnno[grep("^Intron?", panAnnoRegions)]
+panAtacPromoters   <- panAnno[grep("^Promoter?", panAnnoRegions)]
+panAtacExons       <- panAnno[grep("^Exon?", panAnnoRegions)]
+panAtacDistalInt   <- panAnno[grep("^Distal Intergenic?", panAnnoRegions)]
+panAtacUTR5        <- panAnno[grep("^5' UTR?", panAnnoRegions)]
+panAtacUTR3        <- panAnno[grep("^3' UTR?", panAnnoRegions)]
+panAtacDownstream  <- panAnno[grep("^Downstream?", panAnnoRegions)]
+
+## --- LUAD ATAC subsets ---
+luadAtacIntrons     <- panAtacIntrons[grep("^LUAD", panAtacIntrons$names)];       luadIntronsAtacCpGs    <- luadAtacIntrons$names
+luadAtacPromoters   <- panAtacPromoters[grep("^LUAD", panAtacPromoters$names)];   luadPromotersAtacCpGs  <- luadAtacPromoters$names
+luadAtacExons       <- panAtacExons[grep("^LUAD", panAtacExons$names)];           luadExonsAtacCpGs      <- luadAtacExons$names
+luadAtacDistalInt   <- panAtacDistalInt[grep("^LUAD", panAtacDistalInt$names)];   luadDistalIntAtacCpGs  <- luadAtacDistalInt$names
+luadAtacUTR3        <- panAtacUTR3[grep("^LUAD", panAtacUTR3$names)];             luadUTR3AtacCpGs       <- luadAtacUTR3$names
+luadAtacUTR5        <- panAtacUTR5[grep("^LUAD", panAtacUTR5$names)];             luadUTR5AtacCpGs       <- luadAtacUTR5$names
+luadAtacDownstream  <- panAtacDownstream[grep("^LUAD", panAtacDownstream$names)]; luadDownstreamAtacCpGs <- luadAtacDownstream$names
+
+## --- LUSC ATAC subsets ---
+luscAtacIntrons     <- panAtacIntrons[grep("^LUSC", panAtacIntrons$names)];       luscIntronsAtacCpGs    <- luscAtacIntrons$names
+luscAtacPromoters   <- panAtacPromoters[grep("^LUSC", panAtacPromoters$names)];   luscPromotersAtacCpGs  <- luscAtacPromoters$names
+luscAtacExons       <- panAtacExons[grep("^LUSC", panAtacExons$names)];           luscExonsAtacCpGs      <- luscAtacExons$names
+luscAtacDistalInt   <- panAtacDistalInt[grep("^LUSC", panAtacDistalInt$names)];   luscDistalIntAtacCpGs  <- luscAtacDistalInt$names
+luscAtacUTR3        <- panAtacUTR3[grep("^LUSC", panAtacUTR3$names)];             luscUTR3AtacCpGs       <- luscAtacUTR3$names
+luscAtacUTR5        <- panAtacUTR5[grep("^LUSC", panAtacUTR5$names)];             luscUTR5AtacCpGs       <- luscAtacUTR5$names
+luscAtacDownstream  <- panAtacDownstream[grep("^LUSC", panAtacDownstream$names)]; luscDownstreamAtacCpGs <- luscAtacDownstream$names
+
+```
+
+```{r Mean methylation}
+features = c("Introns", "Exons", "Promoters", "UTR3", "DistalInt", "UTR5", "Downstream")
+lungType = c("lusc", "luad")
+
+for (type in lungType) {
+  for (feat in features) {
+    methData <- get(paste0(type, "Meth"))
+    atacData <- get(paste0(type, "Atac"))
+    
+    methGR <- get(paste0(type, "Meth", feat))
+    atacGR <- get(paste0(type, "Atac", feat))
+    
+    methDF <- methData[IDs %in% methGR$names, ]
+    atacDF <- atacData[IDs %in% atacGR$names, ]
+    
+    methMat <- as.matrix(methDF[, .SD, .SDcols = sapply(methDF, is.numeric)])
+    atacMat <- as.matrix(atacDF[, .SD, .SDcols = sapply(atacDF, is.numeric)])
+    
+    methFeatCpGs <- methGR$names
+    atacFeatCpGs <- atacGR$names
+    
+    methAvg <- rowMeans(methMat)
+    atacAvg <- rowMeans(atacMat)
+    
+    matchMethAvg <- setNames(rep(0, length(methFeatCpGs)), methFeatCpGs)
+    matchAtacAvg <- setNames(rep(0, length(atacFeatCpGs)), atacFeatCpGs)
+    
+    matchMethAvg[methDF$IDs] <- methAvg
+    matchAtacAvg[atacDF$IDs] <- atacAvg
+    
+    mcols(methGR)$avg <- matchMethAvg
+    mcols(atacGR)$avg <- matchAtacAvg
+    
+    methVar <- paste0(type, "Meth", feat)
+    atacVar <- paste0(type, "Atac", feat)
+    
+    assign(methVar, methGR, envir = .GlobalEnv)
+    assign(atacVar, atacGR, envir = .GlobalEnv)
+  }
+}
+
+```
+
+# Plot Circos: Averages between Meth & ATAC-seq for LUSC and LUAD
+```{r Plotting Methylation and ATAC-seq}
+sigFeatures <- c("Introns", "Exons", "Promoters", "DistalInt")
+for (feat in sigFeatures) {
+  layout(matrix(1:2, 1, 2))
+  for (type in lungType) {
+    meth <- get(paste0(type, "Meth", feat))
+    atac <- get(paste0(type, "Atac", feat))
+    var <- paste(type, feat)
+    featureComparisonCircosValuesOverlay(meth, atac, var)
+  }
+}
+
+```
+
+# Sort to Chr 7 and 12 to find KMT2C/D
+```{r}
+chromSplit <- function(features, lungType) {
+  for (type in lungType) {
+    for (feat in features) {
+      methVar <- get(paste0(type, "Meth", feat))
+      atacVar <- get(paste0(type, "Atac", feat))
+      
+      methResult <- methVar[methVar$geneChr %in% c(7, 12)]
+      atacResult <- atacVar[atacVar$geneChr %in% c(7, 12)]
+      
+      methName <- paste0(type, "Meth", feat, "Genes")
+      atacName <- paste0(type, "Atac", feat, "Genes")
+      
+      assign(methName, methResult, envir = .GlobalEnv)
+      assign(atacName, atacResult, envir = .GlobalEnv)
+    }
+  }
+}
+
+chromSplit(features, lungType) # Split data into Chr 7 and Chr 12
+
+for (feat in sigFeatures) {
+  layout(matrix(1:2, 1, 2))
+  for (type in lungType) {
+    meth <- get(paste0(type, "Meth", feat, "Genes"))
+    atac <- get(paste0(type, "Atac", feat, "Genes"))
+    var <- paste(type, feat)
+    featureComparisonCircosValuesOverlay(meth, atac, var)
+  }
+}
+
+layout(matrix(1:2, 1, 2))
+featureComparisonCircosValuesOverlay(luscMethPromotersGenes, luscAtacPromotersGenes, "LUSC Promoters")
+featureComparisonCircosValuesOverlay(luadMethPromotersGenes, luadAtacPromotersGenes, "LUAD Promoters")
+```
+
+```{r KMT2C/D Mean Plotting}
+findKMT2Genes <- function (dataType = c("meth", "atac"), lungTypes, features) {
+  for (type in lungTypes) {
+    for (feat in features) {
+      var <- get(paste0(type, tools::toTitleCase(dataType), feat, "Genes"))
+      
+      allGenes <- var$SYMBOL
+      
+      resultName <- paste0(dataType, tools::toTitleCase(type), feat, "KMT2CD")  
+      result <- var[allGenes %in% c("KMT2C", "KMT2D", "MLL2", "MLL3")]
+      
+      assign(resultName, result, envir = .GlobalEnv)
+    }
+  }
+}
+
+findKMT2Genes("meth", lungType, features)
+findKMT2Genes("atac", lungType, features)
+
+for (feat in sigFeatures) {
+  layout(matrix(1:2, 1, 2))
+  for (type in lungType) {
+    meth <- get(paste0("meth", tools::toTitleCase(type), feat, "KMT2CD"))
+    atac <- get(paste0("atac", tools::toTitleCase(type), feat, "KMT2CD"))
+    var <- paste(type, feat)
+    featureComparisonCircosValuesOverlay(meth, atac, var)
+  }
+}
+
+
+featureSingleCircosValues(methLuscIntronsKMT2CD, "Meth LUSC Introns")
+featureSingleCircosValues(methLuadIntronsKMT2CD, "Meth LUAD Introns")
+featureSingleCircosValues(methLuscExonsKMT2CD, "Meth LUSC Exons")
+featureSingleCircosValues(methLuadExonsKMT2CD, "Meth LUAD Exons")
+featureSingleCircosValues(methLuscPromotersKMT2CD, "Meth LUSC Promoters")
+featureSingleCircosValues(methLuadPromotersKMT2CD, "Meth LUAD Promoters")
+featureSingleCircosValues(methLuscDistalIntKMT2CD, "Meth LUSC Distal Intergenic")
+featureSingleCircosValues(methLuadDistalIntKMT2CD, "Meth LUAD Distal Intergenic")
+
+featureSingleCircosValues(atacLuscIntronsKMT2CD, "ATAC LUSC Introns")
+featureSingleCircosValues(atacLuadIntronsKMT2CD, "ATAC LUAD Introns")
+featureSingleCircosValues(atacLuscExonsKMT2CD, "ATAC LUSC Exons")
+featureSingleCircosValues(atacLuadExonsKMT2CD, "ATAC LUAD Exons")
+featureSingleCircosValues(atacLuscPromotersKMT2CD, "ATAC LUSC Promoters")
+featureSingleCircosValues(atacLuadPromotersKMT2CD, "ATAC LUAD Promoters")
+featureSingleCircosValues(atacLuscDistalIntKMT2CD, "ATAC LUSC Distal Intergenic")
+featureSingleCircosValues(atacLuadDistalIntKMT2CD, "ATAC LUAD Distal Intergenic")
+
+featureComparisonCircosValuesOverlay(methLuscDistalIntKMT2CD, atacLuscDistalIntKMT2CD, "LUSC Distal Int")
+
+```
+
+
