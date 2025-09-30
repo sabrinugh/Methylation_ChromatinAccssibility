@@ -1,5 +1,5 @@
 # Methylation_ChromatinAccssibility
-Investigating the interplay between DNA methylation and chromatin modifications in cancers, primarily focusing on TCGA BRCA.
+Investigating the interplay between DNA methylation and chromatin modifications in cancers, primarily focusing on TCGA BRCA. Utilising the KMT2 family genes, KMT2C and KMT2D are the most commonly mutated genes found within breast cancer, leading to either hyper-expression or hypo-expression of the respective gene. Changes to the expression of the KMT2C/D genes can result in hypo- or hyper-methylation of the nucleosome in H3K4, which can further lead to faulty regulation of transcription machinery during gene expression.
 
 ### Data sourced from:
 - Access to all data from the study is available at: https://xenabrowser.net/datapages/?cohort=GDC%20TCGA%20Breast%20Cancer%20(BRCA)&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443 <br/>
