@@ -64,6 +64,10 @@ avgNormal <- rowMeans(normalMeth)
 avgMetastatic <- rowMeans(metastaticMeth)
 avgMethAll <- rowMeans(methMatrix)
 
+medianPrimary <- median(avgPrimary, na.rm= T) # 0.5072542
+medianNormal <- median(avgNormal, na.rm = T) # 0.5191214
+medianMetastatic <- median(avgMetastatic, na.rm = T) # 0.5070332
+
 avgMethylationAll <- data.frame(
   Primary = avgPrimary,
   Normal = avgNormal,
@@ -239,6 +243,9 @@ mutVarAtacAll <- data.frame(
 ```{r}
 # Remove missing data rows
 methProbe <- methProbe[complete.cases(methProbe[, c("chrom", "chromStart", "chromEnd")]), ]
+atacProbe <- atacProbe[complete.cases(atacProbe[, c("chrom", "chromStart", "chromEnd")]), ]
+
+methProbe <- methProbe[, c("chrom", "chromStart", "chromEnd"), ]
 atacProbe <- atacProbe[complete.cases(atacProbe[, c("chrom", "chromStart", "chromEnd")]), ]
 colnames(methProbe)[1] <- "id";colnames(atacProbe)[1] <- "id" #Rename for convention
 
@@ -1088,7 +1095,9 @@ mutualATAC[peakIDs %in% atacIntronsGenes$names, ]
 
 # Pearson's is scale-invariant, so no need to normalise
 corResults <- list()
-corRes <- list()
+# corRes <- list()
+
+# Pearsons for the KMT2C/D genes present in the common BRCA samples
 for (feat in sigFeatures) {
   methIDs <- get("methCpGIDs")
   atacIDs <- get("peakIDs")
@@ -1102,10 +1111,26 @@ for (feat in sigFeatures) {
   test2 <- colMeans(temp[, -1, with = F], na.rm = T)
   
   corResults[[feat]] <- cor.test(test1, test2, method = "pearson")
-  corRes[[feat]] <- cor(test1, test2)
+  # corRes[[feat]] <- cor(test1, test2) # Default Pearson test
 }
+corResults
 
-
+corResults <- list()
+for (feat in sigFeatures) {
+  methIDs <- get("methCpGIDs")
+  atacIDs <- get("peakIDs")
+  
+  methGR <- get(paste0("meth", feat, "Equal"))
+  atacGR <- get(paste0("atac", feat))
+  
+  temp <- mutualMeth[methIDs %in% methGR$names, ]
+  test1 <- colMeans(temp[, -1, with = F], na.rm = T)
+  temp <- mutualATAC[atacIDs %in% atacGR$names, ]
+  test2 <- colMeans(temp[, -1, with = F], na.rm = T)
+  
+  corResults[[feat]] <- cor.test(test1, test2, method = "pearson")
+}
+corResults
 ```
 
 
